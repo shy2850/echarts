@@ -1,1699 +1,1988 @@
+// Enable DEV mode when using source code without build. which has no __DEV__ variable
+// In build process 'typeof __DEV__' will be replace with 'boolean'
+// So this code will be removed or disabled anyway after built.
+if (typeof __DEV__ === 'undefined') {
+    // In browser
+    if (typeof window !== 'undefined') {
+        window.__DEV__ = true;
+    }
+    // In node
+    else if (typeof global !== 'undefined') {
+        global.__DEV__ = true;
+    }
+}
+
 /*!
  * ECharts, a javascript interactive chart library.
- *  
- * Copyright (c) 2013, Baidu Inc.
+ *
+ * Copyright (c) 2015, Baidu Inc.
  * All rights reserved.
- * 
+ *
  * LICENSE
  * https://github.com/ecomfe/echarts/blob/master/LICENSE.txt
  */
 
 /**
- * echarts
- *
- * @desc echarts基于Canvas，纯Javascript图表库，提供直观，生动，可交互，可个性化定制的数据统计图表。
- * @author Kener (@Kener-林峰, linzhifeng@baidu.com)
- *
+ * @module echarts
  */
-define(function(require) {
-    var self = {};
-    var echarts = self;     // 提供内部反向使用静态方法；
-    
-    var _canvasSupported = require('zrender/tool/env').canvasSupported;
-    var _idBase = new Date() - 0;
-    var _instances = {};    // ECharts实例map索引
-    var DOM_ATTRIBUTE_KEY = '_echarts_instance_';
-    
-    self.version = '1.4.1';
-    self.dependencies = {
-        zrender : '1.1.2'
-    };
-    /**
-     * 入口方法 
-     */
-    self.init = function(dom, theme) {
-        dom = dom instanceof Array ? dom[0] : dom;
-        // dom与echarts实例映射索引
-        var key = dom.getAttribute(DOM_ATTRIBUTE_KEY);
-        if (!key) {
-            key = _idBase++;
-            dom.setAttribute(DOM_ATTRIBUTE_KEY, key);
-        }
-        if (_instances[key]) {
-            // 同一个dom上多次init，自动释放已有实例
-            _instances[key].dispose();
-        }
-        _instances[key] = new Echarts(dom);
-        _instances[key].id = key;
-        _instances[key].setTheme(theme);
-        
-        return  _instances[key];
-    };
-    
-    /**
-     * 通过id获得ECharts实例，id可在实例化后读取 
-     */
-    self.getInstanceById = function(key) {
-        return _instances[key];
-    };
+define(function (require) {
 
-    /**
-     * 基于zrender实现Echarts接口层
-     * @param {HtmlElement} dom 必要
-     */
-    function Echarts(dom) {
-        var ecConfig = require('./config');
-        var _themeConfig = require('zrender/tool/util').clone(ecConfig);
+    var env = require('zrender/core/env');
 
-        var self = this;
-        var _zr;
-        var _option;
-        var _optionBackup;          // for各种change和zoom
-        var _optionRestore;         // for restore;
-        var _chartList;             // 图表实例
-        var _messageCenter;         // Echarts层的消息中心，做zrender原始事件转换
-        var _connected = false;
+    var GlobalModel = require('./model/Global');
+    var ExtensionAPI = require('./ExtensionAPI');
+    var CoordinateSystemManager = require('./CoordinateSystem');
+    var OptionManager = require('./model/OptionManager');
 
-        var _status = {         // 用于图表间通信
-            dragIn : false,
-            dragOut : false,
-            needRefresh : false
+    var ComponentModel = require('./model/Component');
+    var SeriesModel = require('./model/Series');
+
+    var ComponentView = require('./view/Component');
+    var ChartView = require('./view/Chart');
+    var graphic = require('./util/graphic');
+    var modelUtil = require('./util/model');
+    var throttle = require('./util/throttle');
+
+    var zrender = require('zrender');
+    var zrUtil = require('zrender/core/util');
+    var colorTool = require('zrender/tool/color');
+    var Eventful = require('zrender/mixin/Eventful');
+    var timsort = require('zrender/core/timsort');
+
+    var each = zrUtil.each;
+    var parseClassType = ComponentModel.parseClassType;
+
+    var PRIORITY_PROCESSOR_FILTER = 1000;
+    var PRIORITY_PROCESSOR_STATISTIC = 5000;
+
+
+    var PRIORITY_VISUAL_LAYOUT = 1000;
+    var PRIORITY_VISUAL_GLOBAL = 2000;
+    var PRIORITY_VISUAL_CHART = 3000;
+    var PRIORITY_VISUAL_COMPONENT = 4000;
+    // FIXME
+    // necessary?
+    var PRIORITY_VISUAL_BRUSH = 5000;
+
+    // Main process have three entries: `setOption`, `dispatchAction` and `resize`,
+    // where they must not be invoked nestedly, except the only case: invoke
+    // dispatchAction with updateMethod "none" in main process.
+    // This flag is used to carry out this rule.
+    // All events will be triggered out side main process (i.e. when !this[IN_MAIN_PROCESS]).
+    var IN_MAIN_PROCESS = '__flagInMainProcess';
+    var HAS_GRADIENT_OR_PATTERN_BG = '__hasGradientOrPatternBg';
+    var OPTION_UPDATED = '__optionUpdated';
+    var ACTION_REG = /^[a-zA-Z0-9_]+$/;
+
+    function createRegisterEventWithLowercaseName(method) {
+        return function (eventName, handler, context) {
+            // Event name is all lowercase
+            eventName = eventName && eventName.toLowerCase();
+            Eventful.prototype[method].call(this, eventName, handler, context);
         };
+    }
 
-        var _selectedMap;
-        var _island;
-        var _toolbox;
-        
-        var _refreshInside;     // 内部刷新标志位
+    /**
+     * @module echarts~MessageCenter
+     */
+    function MessageCenter() {
+        Eventful.call(this);
+    }
+    MessageCenter.prototype.on = createRegisterEventWithLowercaseName('on');
+    MessageCenter.prototype.off = createRegisterEventWithLowercaseName('off');
+    MessageCenter.prototype.one = createRegisterEventWithLowercaseName('one');
+    zrUtil.mixin(MessageCenter, Eventful);
 
-        // 初始化::构造函数
-        _init();
-        function _init() {
-            var zrender = require('zrender');
-            if (((zrender.version || '1.0.3').replace('.', '') - 0)
-                < (echarts.dependencies.zrender.replace('.', '') - 0)
-            ) {
-                console.error(
-                    'ZRender ' + (zrender.version || '1.0.3-') 
-                    + ' is too old for ECharts ' + echarts.version 
-                    + '. Current version need ZRender ' 
-                    + echarts.dependencies.zrender + '+'
-                );
-            }
-            _zr = zrender.init(dom);
+    /**
+     * @module echarts~ECharts
+     */
+    function ECharts(dom, theme, opts) {
+        opts = opts || {};
 
-            _option = {};
-
-            _chartList = [];            // 图表实例
-
-            _messageCenter = {};        // Echarts层的消息中心，做zrender原始事件转换
-            // 添加消息中心的事件分发器特性
-            var zrEvent = require('zrender/tool/event');
-            zrEvent.Dispatcher.call(_messageCenter);
-            for (var e in ecConfig.EVENT) {
-                if (e != 'CLICK' && e != 'HOVER' && e != 'MAP_ROAM') {
-                    _messageCenter.bind(ecConfig.EVENT[e], _onevent);
-                }
-            }
-            
-
-            var zrConfig = require('zrender/config');
-            _zr.on(zrConfig.EVENT.CLICK, _onclick);
-            _zr.on(zrConfig.EVENT.MOUSEOVER, _onhover);
-            //_zr.on(zrConfig.EVENT.MOUSEWHEEL, _onmousewheel);
-            _zr.on(zrConfig.EVENT.DRAGSTART, _ondragstart);
-            _zr.on(zrConfig.EVENT.DRAGEND, _ondragend);
-            _zr.on(zrConfig.EVENT.DRAGENTER, _ondragenter);
-            _zr.on(zrConfig.EVENT.DRAGOVER, _ondragover);
-            _zr.on(zrConfig.EVENT.DRAGLEAVE, _ondragleave);
-            _zr.on(zrConfig.EVENT.DROP, _ondrop);
-
-            // 动态扩展zrender shape：icon、markLine
-            require('./util/shape/icon');
-            require('./util/shape/markLine');
-
-            // 内置图表注册
-            var chartLibrary = require('./chart');
-            require('./chart/island');
-            // 孤岛
-            var Island = chartLibrary.get('island');
-            _island = new Island(_themeConfig, _messageCenter, _zr);
-            
-            // 内置组件注册
-            var componentLibrary = require('./component');
-            require('./component/title');
-            require('./component/axis');
-            require('./component/categoryAxis');
-            require('./component/valueAxis');
-            require('./component/grid');
-            require('./component/dataZoom');
-            require('./component/legend');
-            require('./component/dataRange');
-            require('./component/tooltip');
-            require('./component/toolbox');
-            require('./component/dataView');
-            require('./component/polar');
-            // 工具箱
-            var Toolbox = componentLibrary.get('toolbox');
-            _toolbox = new Toolbox(_themeConfig, _messageCenter, _zr, dom, self);
-            
-            _disposeChartList();
+        // Get theme by name
+        if (typeof theme === 'string') {
+            theme = themeStorage[theme];
         }
 
         /**
-         * ECharts事件处理中心 
+         * @type {string}
          */
-        var _curEventType = null; // 破循环信号灯
-        function _onevent(param){
-            param.__echartsId = param.__echartsId || self.id;
-            var fromMyself = true;
-            if (param.__echartsId != self.id) {
-                // 来自其他联动图表的事件
-                fromMyself = false;
-            }
-            
-            if (!_curEventType) {
-                _curEventType = param.type;
-            }
-            
-            switch(param.type) {
-                case ecConfig.EVENT.LEGEND_SELECTED :
-                    _onlegendSelected(param);
-                    break;
-                case ecConfig.EVENT.DATA_ZOOM :
-                    if (!fromMyself) {
-                        var dz = self.component.dataZoom;
-                        if (dz) {
-                            dz.silence(true);
-                            dz.absoluteZoom(param.zoom);
-                            dz.silence(false);
-                        }
-                    }
-                    _ondataZoom(param);
-                    break;        
-                case ecConfig.EVENT.DATA_RANGE :
-                    fromMyself && _ondataRange(param);
-                    break;        
-                case ecConfig.EVENT.MAGIC_TYPE_CHANGED :
-                    if (!fromMyself) {
-                        var tb = self.component.toolbox;
-                        if (tb) {
-                            tb.silence(true);
-                            tb.setMagicType(param.magicType);
-                            tb.silence(false);
-                        }
-                    }
-                    _onmagicTypeChanged(param);
-                    break;        
-                case ecConfig.EVENT.DATA_VIEW_CHANGED :
-                    fromMyself && _ondataViewChanged(param);
-                    break;        
-                case ecConfig.EVENT.TOOLTIP_HOVER :
-                    fromMyself && _tooltipHover(param);
-                    break;        
-                case ecConfig.EVENT.RESTORE :
-                    _onrestore();
-                    break;        
-                case ecConfig.EVENT.REFRESH :
-                    fromMyself && _onrefresh(param);
-                    break;
-                // 鼠标同步
-                case ecConfig.EVENT.TOOLTIP_IN_GRID :
-                case ecConfig.EVENT.TOOLTIP_OUT_GRID :
-                    if (!fromMyself) {
-                        // 只处理来自外部的鼠标同步
-                        var grid = self.component.grid;
-                        if (grid) {
-                            _zr.trigger(
-                                'mousemove',
-                                {
-                                    connectTrigger : true,
-                                    zrenderX : grid.getX() + param.x * grid.getWidth(),
-                                    zrenderY : grid.getY() + param.y * grid.getHeight()
-                                }
-                            );
-                        }
-                    } 
-                    else if (_connected) {
-                        // 来自自己，并且存在多图联动，空间坐标映射修改参数分发
-                        var grid = self.component.grid;
-                        if (grid) {
-                            param.x = (param.event.zrenderX - grid.getX()) / grid.getWidth();
-                            param.y = (param.event.zrenderY - grid.getY()) / grid.getHeight();
-                        }
-                    }
-                    break;
-                /*
-                case ecConfig.EVENT.RESIZE :
-                case ecConfig.EVENT.DATA_CHANGED :
-                case ecConfig.EVENT.PIE_SELECTED :
-                case ecConfig.EVENT.MAP_SELECTED :
-                    break;
-                */
-            }
-            
-            // 多图联动，只做自己的一级事件分发，避免级联事件循环
-            if (_connected && fromMyself && _curEventType == param.type) { 
-                for (var c in _connected) {
-                    _connected[c].connectedEventHandler(param);
-                }
-                // 分发完毕后复位
-                _curEventType = null;
-            }
-            
-            if (!fromMyself || (!_connected && fromMyself)) {  // 处理了完联动事件复位
-                _curEventType = null;
-            }
-        }
-        
+        this.id;
         /**
-         * 点击事件，响应zrender事件，包装后分发到Echarts层
+         * Group id
+         * @type {string}
          */
-        function _onclick(param) {
-            var len = _chartList.length;
-            while (len--) {
-                _chartList[len]
-                && _chartList[len].onclick
-                && _chartList[len].onclick(param);
-            }
-            if (param.target) {
-                var ecData = _eventPackage(param.target);
-                if (ecData && typeof ecData.seriesIndex != 'undefined') {
-                    _messageCenter.dispatch(
-                        ecConfig.EVENT.CLICK,
-                        param.event,
-                        ecData
-                    );
-                }
-            }
-        }
-
-         /**
-         * 悬浮事件，响应zrender事件，包装后分发到Echarts层
+        this.group;
+        /**
+         * @type {HTMLDomElement}
+         * @private
          */
-        function _onhover(param) {
-            if (param.target) {
-                var ecData = _eventPackage(param.target);
-                if (ecData && typeof ecData.seriesIndex != 'undefined') {
-                    _messageCenter.dispatch(
-                        ecConfig.EVENT.HOVER,
-                        param.event,
-                        ecData
-                    );
-                }
-            }
-        }
+        this._dom = dom;
+        /**
+         * @type {module:zrender/ZRender}
+         * @private
+         */
+        var zr = this._zr = zrender.init(dom, {
+            renderer: opts.renderer || 'canvas',
+            devicePixelRatio: opts.devicePixelRatio,
+            width: opts.width,
+            height: opts.height
+        });
 
         /**
-         * 滚轮回调，孤岛可计算特性
-        function _onmousewheel(param) {
-            _messageCenter.dispatch(
-                ecConfig.EVENT.MOUSEWHEEL,
-                param.event,
-                _eventPackage(param.target)
-            );
-        }
-        */
+         * Expect 60 pfs.
+         * @type {Function}
+         * @private
+         */
+        this._throttledZrFlush = throttle.throttle(zrUtil.bind(zr.flush, zr), 17);
 
         /**
-         * dragstart回调，可计算特性实现
+         * @type {Object}
+         * @private
          */
-        function _ondragstart(param) {
-            // 复位用于图表间通信拖拽标识
-            _status = {
-                dragIn : false,
-                dragOut : false,
-                needRefresh : false
-            };
-            var len = _chartList.length;
-            while (len--) {
-                _chartList[len]
-                && _chartList[len].ondragstart
-                && _chartList[len].ondragstart(param);
-            }
-
-        }
+        this._theme = zrUtil.clone(theme);
 
         /**
-         * dragging回调，可计算特性实现
+         * @type {Array.<module:echarts/view/Chart>}
+         * @private
          */
-        function _ondragenter(param) {
-            var len = _chartList.length;
-            while (len--) {
-                _chartList[len]
-                && _chartList[len].ondragenter
-                && _chartList[len].ondragenter(param);
-            }
-        }
+        this._chartsViews = [];
 
         /**
-         * dragstart回调，可计算特性实现
+         * @type {Object.<string, module:echarts/view/Chart>}
+         * @private
          */
-        function _ondragover(param) {
-            var len = _chartList.length;
-            while (len--) {
-                _chartList[len]
-                && _chartList[len].ondragover
-                && _chartList[len].ondragover(param);
-            }
-        }
-        /**
-         * dragstart回调，可计算特性实现
-         */
-        function _ondragleave(param) {
-            var len = _chartList.length;
-            while (len--) {
-                _chartList[len]
-                && _chartList[len].ondragleave
-                && _chartList[len].ondragleave(param);
-            }
-        }
+        this._chartsMap = {};
 
         /**
-         * dragstart回调，可计算特性实现
+         * @type {Array.<module:echarts/view/Component>}
+         * @private
          */
-        function _ondrop(param) {
-            var len = _chartList.length;
-            while (len--) {
-                _chartList[len]
-                && _chartList[len].ondrop
-                && _chartList[len].ondrop(param, _status);
-            }
-            _island.ondrop(param, _status);
-        }
+        this._componentsViews = [];
 
         /**
-         * dragdone回调 ，可计算特性实现
+         * @type {Object.<string, module:echarts/view/Component>}
+         * @private
          */
-        function _ondragend(param) {
-            var len = _chartList.length;
-            while (len--) {
-                _chartList[len]
-                && _chartList[len].ondragend
-                && _chartList[len].ondragend(param, _status);
-            }
-            _island.ondragend(param, _status);
-
-            // 发生过重计算
-            if (_status.needRefresh) {
-                _syncBackupData(_island.getOption());
-                _messageCenter.dispatch(
-                    ecConfig.EVENT.DATA_CHANGED,
-                    param.event,
-                    _eventPackage(param.target)
-                );
-                _messageCenter.dispatch(ecConfig.EVENT.REFRESH);
-            }
-        }
+        this._componentsMap = {};
 
         /**
-         * 图例选择响应
+         * @type {module:echarts/CoordinateSystem}
+         * @private
          */
-        function _onlegendSelected(param) {
-            // 用于图表间通信
-            _status.needRefresh = false;
-            var len = _chartList.length;
-            while (len--) {
-                _chartList[len]
-                && _chartList[len].onlegendSelected
-                && _chartList[len].onlegendSelected(param, _status);
-            }
-            
-            _selectedMap = param.selected;
-
-            if (_status.needRefresh) {
-                _messageCenter.dispatch(ecConfig.EVENT.REFRESH);
-            }
-        }
+        this._coordSysMgr = new CoordinateSystemManager();
 
         /**
-         * 数据区域缩放响应 
+         * @type {module:echarts/ExtensionAPI}
+         * @private
          */
-        function _ondataZoom(param) {
-            // 用于图表间通信
-            _status.needRefresh = false;
-            var len = _chartList.length;
-            while (len--) {
-                _chartList[len]
-                && _chartList[len].ondataZoom
-                && _chartList[len].ondataZoom(param, _status);
-            }
+        this._api = createExtensionAPI(this);
 
-            if (_status.needRefresh) {
-                _messageCenter.dispatch(ecConfig.EVENT.REFRESH);
-            }
-        }
+        Eventful.call(this);
 
         /**
-         * 值域漫游响应 
+         * @type {module:echarts~MessageCenter}
+         * @private
          */
-        function _ondataRange(param) {
-            // 用于图表间通信
-            _status.needRefresh = false;
-            var len = _chartList.length;
-            while (len--) {
-                _chartList[len]
-                && _chartList[len].ondataRange
-                && _chartList[len].ondataRange(param, _status);
-            }
+        this._messageCenter = new MessageCenter();
 
-            // 没有相互影响，直接刷新即可
-            if (_status.needRefresh) {
-                _zr.refresh();
-            }
-        }
+        // Init mouse events
+        this._initEvents();
 
-        /**
-         * 动态类型切换响应 
-         */
-        function _onmagicTypeChanged() {
-            _render(_getMagicOption());
-        }
+        // In case some people write `window.onresize = chart.resize`
+        this.resize = zrUtil.bind(this.resize, this);
 
-        /**
-         * 数据视图修改响应 
-         */
-        function _ondataViewChanged(param) {
-            _syncBackupData(param.option);
-            _messageCenter.dispatch(
-                ecConfig.EVENT.DATA_CHANGED,
-                null,
-                param
-            );
-            _messageCenter.dispatch(ecConfig.EVENT.REFRESH);
+        // Can't dispatch action during rendering procedure
+        this._pendingActions = [];
+        // Sort on demand
+        function prioritySortFunc(a, b) {
+            return a.prio - b.prio;
         }
-        
-        /**
-         * tooltip与图表间通信 
-         */
-        function _tooltipHover(param) {
-            var len = _chartList.length;
-            var tipShape = [];
-            while (len--) {
-                _chartList[len]
-                && _chartList[len].ontooltipHover
-                && _chartList[len].ontooltipHover(param, tipShape);
-            }
-        }
+        timsort(visualFuncs, prioritySortFunc);
+        timsort(dataProcessorFuncs, prioritySortFunc);
 
-        /**
-         * 还原 
-         */
-        function _onrestore() {
-            self.restore();
-        }
+        zr.animation.on('frame', this._onframe, this);
 
-        /**
-         * 刷新 
-         */
-        function _onrefresh(param) {
-            _refreshInside = true;
-            self.refresh(param);
-            _refreshInside = false;
-        }
-        
-        /**
-         * 当前正在使用的option，还原可能存在的dataZoom
-         */
-        function _getMagicOption(targetOption) {
-            var magicOption = targetOption || _toolbox.getMagicOption();
-            var len;
-            // 横轴数据还原
-            if (_optionBackup.xAxis) {
-                if (_optionBackup.xAxis instanceof Array) {
-                    len = _optionBackup.xAxis.length;
-                    while (len--) {
-                        magicOption.xAxis[len].data =
-                            _optionBackup.xAxis[len].data;
-                    }
-                }
-                else {
-                    magicOption.xAxis.data = _optionBackup.xAxis.data;
-                }
-            }
-            
-            // 纵轴数据还原
-            if (_optionBackup.yAxis) {
-                if (_optionBackup.yAxis instanceof Array) {
-                    len = _optionBackup.yAxis.length;
-                    while (len--) {
-                        magicOption.yAxis[len].data =
-                            _optionBackup.yAxis[len].data;
-                    }
-                }
-                else {
-                    magicOption.yAxis.data = _optionBackup.yAxis.data;
-                }
-            }
+        // ECharts instance can be used as value.
+        zrUtil.setAsPrimitive(this);
+    }
 
-            // 系列数据还原
-            len = magicOption.series.length;
-            while (len--) {
-                magicOption.series[len].data = _optionBackup.series[len].data;
-            }
-            return magicOption;
+    var echartsProto = ECharts.prototype;
+
+    echartsProto._onframe = function () {
+        // Lazy update
+        if (this[OPTION_UPDATED]) {
+            var silent = this[OPTION_UPDATED].silent;
+
+            this[IN_MAIN_PROCESS] = true;
+
+            updateMethods.prepareAndUpdate.call(this);
+
+            this[IN_MAIN_PROCESS] = false;
+
+            this[OPTION_UPDATED] = false;
+
+            flushPendingActions.call(this, silent);
+
+            triggerUpdatedEvent.call(this, silent);
         }
-        
-        /**
-         * 数据修改后的反向同步备份数据 
-         */
-        function _syncBackupData(curOption) {
-            var ecQuery = require('./util/ecQuery');
-            if (ecQuery.query(curOption, 'dataZoom.show')
-                || (
-                    ecQuery.query(curOption, 'toolbox.show')
-                    && ecQuery.query(curOption, 'toolbox.feature.dataZoom.show')
-                )
-            ) {
-                // 有dataZoom就dataZoom做同步
-                for (var i = 0, l = _chartList.length; i < l; i++) {
-                    if (_chartList[i].type == ecConfig.COMPONENT_TYPE_DATAZOOM
-                    ) {
-                        _chartList[i].syncBackupData(curOption, _optionBackup);
-                        return;
-                    }
-                }
-            }
-            else {
-                // 没有就ECharts做
-                var curSeries = curOption.series;
-                var curData;
-                for (var i = 0, l = curSeries.length; i < l; i++) {
-                    curData = curSeries[i].data;
-                    for (var j = 0, k = curData.length; j < k; j++) {
-                        _optionBackup.series[i].data[j] = curData[j];
-                    }
-                }
-            }
+    };
+    /**
+     * @return {HTMLDomElement}
+     */
+    echartsProto.getDom = function () {
+        return this._dom;
+    };
+
+    /**
+     * @return {module:zrender~ZRender}
+     */
+    echartsProto.getZr = function () {
+        return this._zr;
+    };
+
+    /**
+     * Usage:
+     * chart.setOption(option, notMerge, lazyUpdate);
+     * chart.setOption(option, {
+     *     notMerge: ...,
+     *     lazyUpdate: ...,
+     *     silent: ...
+     * });
+     *
+     * @param {Object} option
+     * @param {Object|boolean} [opts] opts or notMerge.
+     * @param {boolean} [opts.notMerge=false]
+     * @param {boolean} [opts.lazyUpdate=false] Useful when setOption frequently.
+     */
+    echartsProto.setOption = function (option, notMerge, lazyUpdate) {
+        if (__DEV__) {
+            zrUtil.assert(!this[IN_MAIN_PROCESS], '`setOption` should not be called during main process.');
         }
 
-        /**
-         * 打包Echarts层的事件附件
-         */
-        function _eventPackage(target) {
-            if (target) {
-                var ecData = require('./util/ecData');
-                
-                var seriesIndex = ecData.get(target, 'seriesIndex');
-                var dataIndex = ecData.get(target, 'dataIndex');
-                
-                dataIndex = self.component.dataZoom
-                            ? self.component.dataZoom.getRealDataIndex(
-                                seriesIndex,
-                                dataIndex
-                              )
-                            : dataIndex;
-                return {
-                    seriesIndex : seriesIndex,
-                    dataIndex : dataIndex,
-                    data : ecData.get(target, 'data'),
-                    name : ecData.get(target, 'name'),
-                    value : ecData.get(target, 'value')
-                };
-            }
+        var silent;
+        if (zrUtil.isObject(notMerge)) {
+            lazyUpdate = notMerge.lazyUpdate;
+            silent = notMerge.silent;
+            notMerge = notMerge.notMerge;
+        }
+
+        this[IN_MAIN_PROCESS] = true;
+
+        if (!this._model || notMerge) {
+            var optionManager = new OptionManager(this._api);
+            var theme = this._theme;
+            var ecModel = this._model = new GlobalModel(null, null, theme, optionManager);
+            ecModel.init(null, null, theme, optionManager);
+        }
+
+        this._model.setOption(option, optionPreprocessorFuncs);
+
+        if (lazyUpdate) {
+            this[OPTION_UPDATED] = {silent: silent};
+            this[IN_MAIN_PROCESS] = false;
+        }
+        else {
+            updateMethods.prepareAndUpdate.call(this);
+            // Ensure zr refresh sychronously, and then pixel in canvas can be
+            // fetched after `setOption`.
+            this._zr.flush();
+
+            this[OPTION_UPDATED] = false;
+            this[IN_MAIN_PROCESS] = false;
+
+            flushPendingActions.call(this, silent);
+            triggerUpdatedEvent.call(this, silent);
+        }
+    };
+
+    /**
+     * @DEPRECATED
+     */
+    echartsProto.setTheme = function () {
+        console.log('ECharts#setTheme() is DEPRECATED in ECharts 3.0');
+    };
+
+    /**
+     * @return {module:echarts/model/Global}
+     */
+    echartsProto.getModel = function () {
+        return this._model;
+    };
+
+    /**
+     * @return {Object}
+     */
+    echartsProto.getOption = function () {
+        return this._model && this._model.getOption();
+    };
+
+    /**
+     * @return {number}
+     */
+    echartsProto.getWidth = function () {
+        return this._zr.getWidth();
+    };
+
+    /**
+     * @return {number}
+     */
+    echartsProto.getHeight = function () {
+        return this._zr.getHeight();
+    };
+
+    /**
+     * @return {number}
+     */
+    echartsProto.getDevicePixelRatio = function () {
+        return this._zr.painter.dpr || window.devicePixelRatio || 1;
+    };
+
+    /**
+     * Get canvas which has all thing rendered
+     * @param {Object} opts
+     * @param {string} [opts.backgroundColor]
+     */
+    echartsProto.getRenderedCanvas = function (opts) {
+        if (!env.canvasSupported) {
             return;
         }
+        opts = opts || {};
+        opts.pixelRatio = opts.pixelRatio || 1;
+        opts.backgroundColor = opts.backgroundColor
+            || this._model.get('backgroundColor');
+        var zr = this._zr;
+        var list = zr.storage.getDisplayList();
+        // Stop animations
+        zrUtil.each(list, function (el) {
+            el.stopAnimation(true);
+        });
+        return zr.painter.getRenderedCanvas(opts);
+    };
+    /**
+     * @return {string}
+     * @param {Object} opts
+     * @param {string} [opts.type='png']
+     * @param {string} [opts.pixelRatio=1]
+     * @param {string} [opts.backgroundColor]
+     * @param {string} [opts.excludeComponents]
+     */
+    echartsProto.getDataURL = function (opts) {
+        opts = opts || {};
+        var excludeComponents = opts.excludeComponents;
+        var ecModel = this._model;
+        var excludesComponentViews = [];
+        var self = this;
 
-        /**
-         * 图表渲染 
-         */
-        function _render(magicOption) {
-            _mergeGlobalConifg(magicOption);
-            if (magicOption.backgroundColor) {
-                if (!_canvasSupported 
-                    && magicOption.backgroundColor.indexOf('rgba') != -1
-                ) {
-                    // IE6~8对RGBA的处理，filter会带来其他颜色的影响
-                    var cList = magicOption.backgroundColor.split(',');
-                    dom.style.filter = 'alpha(opacity=' +
-                        cList[3].substring(0, cList[3].lastIndexOf(')')) * 100
-                        + ')';
-                    cList.length = 3;
-                    cList[0] = cList[0].replace('a', '');
-                    dom.style.backgroundColor = cList.join(',') + ')';
+        each(excludeComponents, function (componentType) {
+            ecModel.eachComponent({
+                mainType: componentType
+            }, function (component) {
+                var view = self._componentsMap[component.__viewId];
+                if (!view.group.ignore) {
+                    excludesComponentViews.push(view);
+                    view.group.ignore = true;
                 }
-                else {
-                    dom.style.backgroundColor = magicOption.backgroundColor;
+            });
+        });
+
+        var url = this.getRenderedCanvas(opts).toDataURL(
+            'image/' + (opts && opts.type || 'png')
+        );
+
+        each(excludesComponentViews, function (view) {
+            view.group.ignore = false;
+        });
+        return url;
+    };
+
+
+    /**
+     * @return {string}
+     * @param {Object} opts
+     * @param {string} [opts.type='png']
+     * @param {string} [opts.pixelRatio=1]
+     * @param {string} [opts.backgroundColor]
+     */
+    echartsProto.getConnectedDataURL = function (opts) {
+        if (!env.canvasSupported) {
+            return;
+        }
+        var groupId = this.group;
+        var mathMin = Math.min;
+        var mathMax = Math.max;
+        var MAX_NUMBER = Infinity;
+        if (connectedGroups[groupId]) {
+            var left = MAX_NUMBER;
+            var top = MAX_NUMBER;
+            var right = -MAX_NUMBER;
+            var bottom = -MAX_NUMBER;
+            var canvasList = [];
+            var dpr = (opts && opts.pixelRatio) || 1;
+
+            zrUtil.each(instances, function (chart, id) {
+                if (chart.group === groupId) {
+                    var canvas = chart.getRenderedCanvas(
+                        zrUtil.clone(opts)
+                    );
+                    var boundingRect = chart.getDom().getBoundingClientRect();
+                    left = mathMin(boundingRect.left, left);
+                    top = mathMin(boundingRect.top, top);
+                    right = mathMax(boundingRect.right, right);
+                    bottom = mathMax(boundingRect.bottom, bottom);
+                    canvasList.push({
+                        dom: canvas,
+                        left: boundingRect.left,
+                        top: boundingRect.top
+                    });
                 }
-            }
-            
-            _disposeChartList();
-            _zr.clear();
+            });
 
-            var chartLibrary = require('./chart');
-            var componentLibrary = require('./component');
+            left *= dpr;
+            top *= dpr;
+            right *= dpr;
+            bottom *= dpr;
+            var width = right - left;
+            var height = bottom - top;
+            var targetCanvas = zrUtil.createCanvas();
+            targetCanvas.width = width;
+            targetCanvas.height = height;
+            var zr = zrender.init(targetCanvas);
 
-            // 标题
-            var title;
-            if (magicOption.title) {
-                var Title = componentLibrary.get('title');
-                title = new Title(
-                    _themeConfig, _messageCenter, _zr, magicOption
-                );
-                _chartList.push(title);
-                self.component.title = title;
-            }
-
-            // 提示
-            var tooltip;
-            if (magicOption.tooltip) {
-                var Tooltip = componentLibrary.get('tooltip');
-                tooltip = new Tooltip(
-                    _themeConfig, _messageCenter, _zr, magicOption, dom, self
-                );
-                _chartList.push(tooltip);
-                self.component.tooltip = tooltip;
-            }
-
-            // 图例
-            var legend;
-            if (magicOption.legend) {
-                var Legend = componentLibrary.get('legend');
-                legend = new Legend(
-                    _themeConfig, _messageCenter, _zr, magicOption, _selectedMap
-                );
-                _chartList.push(legend);
-                self.component.legend = legend;
-            }
-
-            // 值域控件
-            var dataRange;
-            if (magicOption.dataRange) {
-                var DataRange = componentLibrary.get('dataRange');
-                dataRange = new DataRange(
-                    _themeConfig, _messageCenter, _zr, magicOption
-                );
-                _chartList.push(dataRange);
-                self.component.dataRange = dataRange;
-            }
-
-            // 直角坐标系
-            var grid;
-            var dataZoom;
-            var xAxis;
-            var yAxis;
-            if (magicOption.grid || magicOption.xAxis || magicOption.yAxis) {
-                var Grid = componentLibrary.get('grid');
-                grid = new Grid(_themeConfig, _messageCenter, _zr, magicOption);
-                _chartList.push(grid);
-                self.component.grid = grid;
-
-                var DataZoom = componentLibrary.get('dataZoom');
-                dataZoom = new DataZoom(
-                    _themeConfig, 
-                    _messageCenter,
-                    _zr,
-                    magicOption,
-                    {
-                        'legend' : legend,
-                        'grid' : grid
+            each(canvasList, function (item) {
+                var img = new graphic.Image({
+                    style: {
+                        x: item.left * dpr - left,
+                        y: item.top * dpr - top,
+                        image: item.dom
                     }
-                );
-                _chartList.push(dataZoom);
-                self.component.dataZoom = dataZoom;
+                });
+                zr.add(img);
+            });
+            zr.refreshImmediately();
 
-                var Axis = componentLibrary.get('axis');
-                xAxis = new Axis(
-                    _themeConfig,
-                    _messageCenter,
-                    _zr,
-                    magicOption,
-                    {
-                        'legend' : legend,
-                        'grid' : grid
-                    },
-                    'xAxis'
-                );
-                _chartList.push(xAxis);
-                self.component.xAxis = xAxis;
+            return targetCanvas.toDataURL('image/' + (opts && opts.type || 'png'));
+        }
+        else {
+            return this.getDataURL(opts);
+        }
+    };
 
-                yAxis = new Axis(
-                    _themeConfig,
-                    _messageCenter,
-                    _zr,
-                    magicOption,
-                    {
-                        'legend' : legend,
-                        'grid' : grid
-                    },
-                    'yAxis'
-                );
-                _chartList.push(yAxis);
-                self.component.yAxis = yAxis;
+    /**
+     * Convert from logical coordinate system to pixel coordinate system.
+     * See CoordinateSystem#convertToPixel.
+     * @param {string|Object} finder
+     *        If string, e.g., 'geo', means {geoIndex: 0}.
+     *        If Object, could contain some of these properties below:
+     *        {
+     *            seriesIndex / seriesId / seriesName,
+     *            geoIndex / geoId, geoName,
+     *            bmapIndex / bmapId / bmapName,
+     *            xAxisIndex / xAxisId / xAxisName,
+     *            yAxisIndex / yAxisId / yAxisName,
+     *            gridIndex / gridId / gridName,
+     *            ... (can be extended)
+     *        }
+     * @param {Array|number} value
+     * @return {Array|number} result
+     */
+    echartsProto.convertToPixel = zrUtil.curry(doConvertPixel, 'convertToPixel');
+
+    /**
+     * Convert from pixel coordinate system to logical coordinate system.
+     * See CoordinateSystem#convertFromPixel.
+     * @param {string|Object} finder
+     *        If string, e.g., 'geo', means {geoIndex: 0}.
+     *        If Object, could contain some of these properties below:
+     *        {
+     *            seriesIndex / seriesId / seriesName,
+     *            geoIndex / geoId / geoName,
+     *            bmapIndex / bmapId / bmapName,
+     *            xAxisIndex / xAxisId / xAxisName,
+     *            yAxisIndex / yAxisId / yAxisName
+     *            gridIndex / gridId / gridName,
+     *            ... (can be extended)
+     *        }
+     * @param {Array|number} value
+     * @return {Array|number} result
+     */
+    echartsProto.convertFromPixel = zrUtil.curry(doConvertPixel, 'convertFromPixel');
+
+    function doConvertPixel(methodName, finder, value) {
+        var ecModel = this._model;
+        var coordSysList = this._coordSysMgr.getCoordinateSystems();
+        var result;
+
+        finder = modelUtil.parseFinder(ecModel, finder);
+
+        for (var i = 0; i < coordSysList.length; i++) {
+            var coordSys = coordSysList[i];
+            if (coordSys[methodName]
+                && (result = coordSys[methodName](ecModel, finder, value)) != null
+            ) {
+                return result;
             }
+        }
 
-            // 极坐标系
-            var polar;
-            if (magicOption.polar) {
-                var Polar = componentLibrary.get('polar');
-                polar = new Polar(
-                    _themeConfig,
-                    _messageCenter,
-                    _zr,
-                    magicOption,
-                    {
-                        'legend' : legend
-                    }
-                );
-                _chartList.push(polar);
-                self.component.polar = polar;
-            }
-            
-            tooltip && tooltip.setComponent();
+        if (__DEV__) {
+            console.warn(
+                'No coordinate system that supports ' + methodName + ' found by the given finder.'
+            );
+        }
+    }
 
-            var ChartClass;
-            var chartType;
-            var chart;
-            var chartMap = {};      // 记录已经初始化的图表
-            for (var i = 0, l = magicOption.series.length; i < l; i++) {
-                chartType = magicOption.series[i].type;
-                if (!chartType) {
-                    console.error('series[' + i + '] chart type has not been defined.');
-                    continue;
+    /**
+     * Is the specified coordinate systems or components contain the given pixel point.
+     * @param {string|Object} finder
+     *        If string, e.g., 'geo', means {geoIndex: 0}.
+     *        If Object, could contain some of these properties below:
+     *        {
+     *            seriesIndex / seriesId / seriesName,
+     *            geoIndex / geoId / geoName,
+     *            bmapIndex / bmapId / bmapName,
+     *            xAxisIndex / xAxisId / xAxisName,
+     *            yAxisIndex / yAxisId / yAxisName,
+     *            gridIndex / gridId / gridName,
+     *            ... (can be extended)
+     *        }
+     * @param {Array|number} value
+     * @return {boolean} result
+     */
+    echartsProto.containPixel = function (finder, value) {
+        var ecModel = this._model;
+        var result;
+
+        finder = modelUtil.parseFinder(ecModel, finder);
+
+        zrUtil.each(finder, function (models, key) {
+            key.indexOf('Models') >= 0 && zrUtil.each(models, function (model) {
+                var coordSys = model.coordinateSystem;
+                if (coordSys && coordSys.containPoint) {
+                    result |= !!coordSys.containPoint(value);
                 }
-                if (!chartMap[chartType]) {
-                    chartMap[chartType] = true;
-                    ChartClass = chartLibrary.get(chartType);
-                    if (ChartClass) {
-                        chart = new ChartClass(
-                            _themeConfig,
-                            _messageCenter,
-                            _zr,
-                            magicOption,
-                            {
-                                'tooltip' : tooltip,
-                                'legend' : legend,
-                                'dataRange' : dataRange,
-                                'grid' : grid,
-                                'xAxis' : xAxis,
-                                'yAxis' : yAxis,
-                                'polar' : polar
-                            }
-                        );
-                        _chartList.push(chart);
-                        self.chart[chartType] = chart;
+                else if (key === 'seriesModels') {
+                    var view = this._chartsMap[model.__viewId];
+                    if (view && view.containPoint) {
+                        result |= view.containPoint(value, model);
                     }
                     else {
-                        console.error(chartType + ' has not been required.');
+                        if (__DEV__) {
+                            console.warn(key + ': ' + (view
+                                ? 'The found component do not support containPoint.'
+                                : 'No view mapping to the found component.'
+                            ));
+                        }
                     }
-                }
-            }
-
-            _island.render(magicOption);
-
-            _toolbox.render(magicOption, {dataZoom: dataZoom});
-            
-            if (magicOption.animation && !magicOption.renderAsImage) {
-                var len = _chartList.length;
-                while (len--) {
-                    chart = _chartList[len];                 
-                    if (chart 
-                        && chart.animation 
-                        && chart.shapeList 
-                        && chart.shapeList.length 
-                           < magicOption.animationThreshold
-                    ) {
-                        chart.animation();
-                    }
-                }
-                _zr.refresh();
-            }
-            else {
-                _zr.render();
-            }
-            
-            var imgId = 'IMG' + self.id;
-            var img = document.getElementById(imgId);
-            if (magicOption.renderAsImage && _canvasSupported) {
-                // IE8- 不支持图片渲染形式
-                if (img) {
-                    // 已经渲染过则更新显示
-                    img.src = getDataURL(magicOption.renderAsImage);
                 }
                 else {
-                    // 没有渲染过插入img dom
-                    img = getImage(magicOption.renderAsImage);
-                    img.id = imgId;
-                    img.style.position = 'absolute';
-                    img.style.left = 0;
-                    img.style.top = 0;
-                    dom.firstChild.appendChild(img);
-                }
-                un();
-                _zr.un();
-                _disposeChartList();
-                _zr.clear();
-            }
-            else if (img) {
-                // 删除可能存在的img
-                img.parentNode.removeChild(img);
-            }
-            img = null;
-        }
-
-        /**
-         * 还原 
-         */
-        function restore() {
-            var zrUtil = require('zrender/tool/util');
-            if (_optionRestore.legend && _optionRestore.legend.selected) {
-                _selectedMap = _optionRestore.legend.selected;
-            }
-            else {
-                _selectedMap = {};
-            }
-            _optionBackup = zrUtil.clone(_optionRestore);
-            _option = zrUtil.clone(_optionRestore);
-            _island.clear();
-            _toolbox.reset(_option);
-            _render(_option);
-        }
-
-        /**
-         * 刷新 
-         * @param {Object=} param，可选参数，用于附带option，内部同步用，外部不建议带入数据修改，无法同步 
-         */
-        function refresh(param) {
-            param = param || {};
-            var magicOption = param.option;
-            
-            // 外部调用的refresh且有option带入
-            if (!_refreshInside && param.option) {
-                // 做简单的差异合并去同步内部持有的数据克隆，不建议带入数据
-                // 开启数据区域缩放、拖拽重计算、数据视图可编辑模式情况下，当用户产生了数据变化后无法同步
-                // 如有带入option存在数据变化，请重新setOption
-                var ecQuery = require('./util/ecQuery');
-                if (ecQuery.query(_optionBackup, 'toolbox.show')
-                    && ecQuery.query(_optionBackup, 'toolbox.feature.magicType.show')
-                ) {
-                    magicOption = _getMagicOption();
-                }
-                else {
-                    magicOption = _getMagicOption(_island.getOption());
-                }
-                
-                var zrUtil = require('zrender/tool/util');
-                zrUtil.merge(
-                    magicOption, param.option,
-                    { 'overwrite': true, 'recursive': true }
-                );
-                zrUtil.merge(
-                    _optionBackup, param.option,
-                    { 'overwrite': true, 'recursive': true }
-                );
-                zrUtil.merge(
-                    _optionRestore, param.option,
-                    { 'overwrite': true, 'recursive': true }
-                );
-                _island.refresh(magicOption);
-                _toolbox.refresh(magicOption);
-            }
-            
-            // 停止动画
-            _zr.clearAnimation();
-            // 先来后到，安顺序刷新各种图表，图表内部refresh优化检查magicOption，无需更新则不更新~
-            for (var i = 0, l = _chartList.length; i < l; i++) {
-                _chartList[i].refresh && _chartList[i].refresh(magicOption);
-            }
-            _zr.refresh();
-        }
-
-        /**
-         * 释放图表实例
-         */
-        function _disposeChartList() {
-            // 停止动画
-            _zr.clearAnimation();
-            var len = _chartList.length;
-            while (len--) {
-                _chartList[len]
-                && _chartList[len].dispose 
-                && _chartList[len].dispose();
-            }
-            _chartList = [];
-            
-            self.chart = {
-                island : _island
-            };
-            self.component = {
-                toolbox : _toolbox
-            };
-        }
-
-        /**
-         * 非图表全局属性merge~~ 
-         */
-        function _mergeGlobalConifg(magicOption) {
-            // 背景
-            if (typeof magicOption.backgroundColor == 'undefined') {
-                magicOption.backgroundColor = _themeConfig.backgroundColor;
-            }
-            
-            // 拖拽重计算相关
-            if (typeof magicOption.calculable == 'undefined') {
-                magicOption.calculable = _themeConfig.calculable;
-            }
-            if (typeof magicOption.calculableColor == 'undefined') {
-                magicOption.calculableColor = _themeConfig.calculableColor;
-            }
-            if (typeof magicOption.calculableHolderColor == 'undefined') {
-                magicOption.calculableHolderColor = _themeConfig.calculableHolderColor;
-            }
-            
-            // 孤岛显示连接符
-            if (typeof magicOption.nameConnector == 'undefined') {
-                magicOption.nameConnector = _themeConfig.nameConnector;
-            }
-            if (typeof magicOption.valueConnector == 'undefined') {
-                magicOption.valueConnector = _themeConfig.valueConnector;
-            }
-            
-            // 动画相关
-            if (typeof magicOption.animation == 'undefined') {
-                magicOption.animation = _themeConfig.animation;
-            }
-            if (typeof magicOption.animationThreshold == 'undefined') {
-                magicOption.animationThreshold = _themeConfig.animationThreshold;
-            }
-            if (typeof magicOption.animationDuration == 'undefined') {
-                magicOption.animationDuration = _themeConfig.animationDuration;
-            }
-            if (typeof magicOption.animationEasing == 'undefined') {
-                magicOption.animationEasing = _themeConfig.animationEasing;
-            }
-            if (typeof magicOption.addDataAnimation == 'undefined') {
-                magicOption.addDataAnimation = _themeConfig.addDataAnimation;
-            }
-            
-            // 默认标志图形类型列表
-            /*
-            if (typeof magicOption.symbolList == 'undefined') {
-                magicOption.symbolList = _themeConfig.symbolList;
-            }
-            */
-
-            var zrColor = require('zrender/tool/color');
-            // 数值系列的颜色列表，不传则采用内置颜色，可配数组，借用zrender实例注入，会有冲突风险，先这样
-            if (magicOption.color && magicOption.color.length > 0) {
-                _zr.getColor = function(idx) {
-                    return zrColor.getColor(idx, magicOption.color);
-                };
-            }
-            else {
-                _zr.getColor = function(idx) {
-                    return zrColor.getColor(idx, _themeConfig.color);
-                };
-            }
-            
-            // 降低图表内元素拖拽敏感度，单位ms，不建议外部干预
-            if (typeof magicOption.DRAG_ENABLE_TIME == 'undefined') {
-                magicOption.DRAG_ENABLE_TIME = _themeConfig.DRAG_ENABLE_TIME;
-            }
-        }
-        
-        /**
-         * 万能接口，配置图表实例任何可配置选项，多次调用时option选项做merge处理
-         * @param {Object} option
-         * @param {boolean=} notMerge 多次调用时option选项是默认是合并（merge）的，
-         *                   如果不需求，可以通过notMerger参数为true阻止与上次option的合并
-         */
-        function setOption(option, notMerge) {
-            var zrUtil = require('zrender/tool/util');
-            if (!notMerge) {
-                zrUtil.merge(
-                    _option,
-                    zrUtil.clone(option),
-                    {
-                        'overwrite': true,
-                        'recursive': true
+                    if (__DEV__) {
+                        console.warn(key + ': containPoint is not supported');
                     }
-                );
-            }
-            else {
-                _option = zrUtil.clone(option);
-            }
+                }
+            }, this);
+        }, this);
 
-            if (!_option.series || _option.series.length === 0) {
+        return !!result;
+    };
+
+    /**
+     * Get visual from series or data.
+     * @param {string|Object} finder
+     *        If string, e.g., 'series', means {seriesIndex: 0}.
+     *        If Object, could contain some of these properties below:
+     *        {
+     *            seriesIndex / seriesId / seriesName,
+     *            dataIndex / dataIndexInside
+     *        }
+     *        If dataIndex is not specified, series visual will be fetched,
+     *        but not data item visual.
+     *        If all of seriesIndex, seriesId, seriesName are not specified,
+     *        visual will be fetched from first series.
+     * @param {string} visualType 'color', 'symbol', 'symbolSize'
+     */
+    echartsProto.getVisual = function (finder, visualType) {
+        var ecModel = this._model;
+
+        finder = modelUtil.parseFinder(ecModel, finder, {defaultMainType: 'series'});
+
+        var seriesModel = finder.seriesModel;
+
+        if (__DEV__) {
+            if (!seriesModel) {
+                console.warn('There is no specified seires model');
+            }
+        }
+
+        var data = seriesModel.getData();
+
+        var dataIndexInside = finder.hasOwnProperty('dataIndexInside')
+            ? finder.dataIndexInside
+            : finder.hasOwnProperty('dataIndex')
+            ? data.indexOfRawIndex(finder.dataIndex)
+            : null;
+
+        return dataIndexInside != null
+            ? data.getItemVisual(dataIndexInside, visualType)
+            : data.getVisual(visualType);
+    };
+
+    /**
+     * Get view of corresponding component model
+     * @param  {module:echarts/model/Component} componentModel
+     * @return {module:echarts/view/Component}
+     */
+    echartsProto.getViewOfComponentModel = function (componentModel) {
+        return this._componentsMap[componentModel.__viewId];
+    };
+
+    /**
+     * Get view of corresponding series model
+     * @param  {module:echarts/model/Series} seriesModel
+     * @return {module:echarts/view/Chart}
+     */
+    echartsProto.getViewOfSeriesModel = function (seriesModel) {
+        return this._chartsMap[seriesModel.__viewId];
+    };
+
+
+    var updateMethods = {
+
+        /**
+         * @param {Object} payload
+         * @private
+         */
+        update: function (payload) {
+            // console.profile && console.profile('update');
+
+            var ecModel = this._model;
+            var api = this._api;
+            var coordSysMgr = this._coordSysMgr;
+            var zr = this._zr;
+            // update before setOption
+            if (!ecModel) {
                 return;
             }
 
-            _optionBackup = zrUtil.clone(_option);
-            _optionRestore = zrUtil.clone(_option);
-            
-            if (_option.legend && _option.legend.selected) {
-                _selectedMap = _option.legend.selected;
-            }
-            else {
-                _selectedMap = {};
-            }
+            // Fixme First time update ?
+            ecModel.restoreData();
 
-            _island.clear();
-            _toolbox.reset(_option);
-            _render(_option);
-            return self;
-        }
+            // TODO
+            // Save total ecModel here for undo/redo (after restoring data and before processing data).
+            // Undo (restoration of total ecModel) can be carried out in 'action' or outside API call.
 
-        /**
-         * 返回内部持有的当前显示option克隆 
-         */
-        function getOption() {
-            var ecQuery = require('./util/ecQuery');
-            var zrUtil = require('zrender/tool/util');
-            if (ecQuery.query(_optionBackup, 'toolbox.show')
-                && ecQuery.query(_optionBackup, 'toolbox.feature.magicType.show')
-            ) {
-                 return zrUtil.clone(_getMagicOption());
-            }
-            else {
-                 return zrUtil.clone(_getMagicOption(_island.getOption()));
-            }
-        }
+            // Create new coordinate system each update
+            // In LineView may save the old coordinate system and use it to get the orignal point
+            coordSysMgr.create(this._model, this._api);
 
-        /**
-         * 数据设置快捷接口
-         * @param {Array} series
-         * @param {boolean=} notMerge 多次调用时option选项是默认是合并（merge）的，
-         *                   如果不需求，可以通过notMerger参数为true阻止与上次option的合并。
-         */
-        function setSeries(series, notMerge) {
-            if (!notMerge) {
-                self.setOption({series: series});
-            }
-            else {
-                _option.series = series;
-                self.setOption(_option, notMerge);
-            }
-            return self;
-        }
+            processData.call(this, ecModel, api);
 
-        /**
-         * 返回内部持有的当前显示series克隆 
-         */
-        function getSeries() {
-            return getOption().series;
-        }
-        
-        /**
-         * 动态数据添加
-         * 形参为单组数据参数，多组时为数据，内容同[seriesIdx, data, isShift, additionData]
-         * @param {number} seriesIdx 系列索引
-         * @param {number | Object} data 增加数据
-         * @param {boolean=} isHead 是否队头加入，默认，不指定或false时为队尾插入
-         * @param {boolean=} dataGrow 是否增长数据队列长度，默认，不指定或false时移出目标数组对位数据
-         * @param {string=} additionData 是否增加类目轴(饼图为图例)数据，附加操作同isHead和dataGrow
-         */
-        function addData(seriesIdx, data, isHead, dataGrow, additionData) {
-            var ecQuery = require('./util/ecQuery');
-            var magicOption;
-            if (ecQuery.query(_optionBackup, 'toolbox.show')
-                && ecQuery.query(_optionBackup, 'toolbox.feature.magicType.show')
-            ) {
-                magicOption = _getMagicOption();
-            }
-            else {
-                magicOption = _getMagicOption(_island.getOption());
-            }
-            
-            var zrUtil = require('zrender/tool/util');
-            var params = seriesIdx instanceof Array
-                         ? seriesIdx
-                         : [[seriesIdx, data, isHead, dataGrow, additionData]];
-            var axisIdx;
-            var legendDataIdx;
-            //_optionRestore 和 _optionBackup都要同步
-            for (var i = 0, l = params.length; i < l; i++) {
-                seriesIdx = params[i][0];
-                data = params[i][1];
-                isHead = params[i][2];
-                dataGrow = params[i][3];
-                additionData = params[i][4];
-                if (_optionRestore.series[seriesIdx]) {
-                    if (isHead) {
-                        _optionRestore.series[seriesIdx].data.unshift(data);
-                        _optionBackup.series[seriesIdx].data.unshift(data);
-                        if (!dataGrow) {
-                            _optionRestore.series[seriesIdx].data.pop();
-                            data = _optionBackup.series[seriesIdx].data.pop();
-                        }
-                    }
-                    else {
-                        _optionRestore.series[seriesIdx].data.push(data);
-                        _optionBackup.series[seriesIdx].data.push(data);
-                        if (!dataGrow) {
-                            _optionRestore.series[seriesIdx].data.shift();
-                            data = _optionBackup.series[seriesIdx].data.shift();
-                        }
-                    }
-                    
-                    if (typeof additionData != 'undefined'
-                        && _optionRestore.series[seriesIdx].type 
-                           == ecConfig.CHART_TYPE_PIE
-                        && _optionBackup.legend 
-                        && _optionBackup.legend.data
-                    ) {
-                        magicOption.legend.data = _optionBackup.legend.data;
-                        if (isHead) {
-                            _optionRestore.legend.data.unshift(additionData);
-                            _optionBackup.legend.data.unshift(additionData);
-                        }
-                        else {
-                            _optionRestore.legend.data.push(additionData);
-                            _optionBackup.legend.data.push(additionData);
-                        }
-                        if (!dataGrow) {
-                            legendDataIdx = zrUtil.indexOf(
-                                _optionBackup.legend.data,
-                                data.name
-                            );
-                            legendDataIdx != -1
-                            && (
-                                _optionRestore.legend.data.splice(
-                                    legendDataIdx, 1
-                                ),
-                                _optionBackup.legend.data.splice(
-                                    legendDataIdx, 1
-                                )
-                            );
-                        }
-                        _selectedMap[additionData] = true;
-                    } 
-                    else  if (typeof additionData != 'undefined'
-                        && typeof _optionRestore.xAxis != 'undefined'
-                        && typeof _optionRestore.yAxis != 'undefined'
-                    ) {
-                        // x轴类目
-                        axisIdx = _optionRestore.series[seriesIdx].xAxisIndex
-                                  || 0;
-                        if (typeof _optionRestore.xAxis[axisIdx].type 
-                            == 'undefined'
-                            || _optionRestore.xAxis[axisIdx].type == 'category'
-                        ) {
-                            if (isHead) {
-                                _optionRestore.xAxis[axisIdx].data.unshift(
-                                    additionData
-                                );
-                                _optionBackup.xAxis[axisIdx].data.unshift(
-                                    additionData
-                                );
-                                if (!dataGrow) {
-                                    _optionRestore.xAxis[axisIdx].data.pop();
-                                    _optionBackup.xAxis[axisIdx].data.pop();
-                                }
-                            }
-                            else {
-                                _optionRestore.xAxis[axisIdx].data.push(
-                                    additionData
-                                );
-                                _optionBackup.xAxis[axisIdx].data.push(
-                                    additionData
-                                );
-                                if (!dataGrow) {
-                                    _optionRestore.xAxis[axisIdx].data.shift();
-                                    _optionBackup.xAxis[axisIdx].data.shift();
-                                }
-                            }
-                        }
-                        
-                        // y轴类目
-                        axisIdx = _optionRestore.series[seriesIdx].yAxisIndex
-                                  || 0;
-                        if (_optionRestore.yAxis[axisIdx].type == 'category') {
-                            if (isHead) {
-                                _optionRestore.yAxis[axisIdx].data.unshift(
-                                    additionData
-                                );
-                                _optionBackup.yAxis[axisIdx].data.unshift(
-                                    additionData
-                                );
-                                if (!dataGrow) {
-                                    _optionRestore.yAxis[axisIdx].data.pop();
-                                    _optionBackup.yAxis[axisIdx].data.pop();
-                                }
-                            }
-                            else {
-                                _optionRestore.yAxis[axisIdx].data.push(
-                                    additionData
-                                );
-                                _optionBackup.yAxis[axisIdx].data.push(
-                                    additionData
-                                );
-                                if (!dataGrow) {
-                                    _optionRestore.yAxis[axisIdx].data.shift();
-                                    _optionBackup.yAxis[axisIdx].data.shift();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            magicOption.legend && (magicOption.legend.selected = _selectedMap);
-            // dataZoom同步数据
-            for (var i = 0, l = _chartList.length; i < l; i++) {
-                if (magicOption.addDataAnimation 
-                    && _chartList[i].addDataAnimation
-                ) {
-                    _chartList[i].addDataAnimation(params);
-                }
-                if (_chartList[i].type 
-                    == ecConfig.COMPONENT_TYPE_DATAZOOM
-                ) {
-                    _chartList[i].silence(true);
-                    _chartList[i].init(magicOption);
-                    _chartList[i].silence(false);
-                }
-            }
-            _island.refresh(magicOption);
-            _toolbox.refresh(magicOption);
-            setTimeout(function(){
-                _messageCenter.dispatch(
-                    ecConfig.EVENT.REFRESH,
-                    '',
-                    {option: magicOption}
-                );
-            }, magicOption.addDataAnimation ? 500 : 0);
-            return self;
-        }
+            stackSeriesData.call(this, ecModel);
 
-        /**
-         * 获取当前dom 
-         */
-        function getDom() {
-            return dom;
-        }
-        
-        /**
-         * 获取当前zrender实例，可用于添加额为的shape和深度控制 
-         */
-        function getZrender() {
-            return _zr;
-        }
+            coordSysMgr.update(ecModel, api);
 
-        /**
-         * 获取Base64图片dataURL
-         * @param {string} imgType 图片类型，支持png|jpeg，默认为png
-         * @return imgDataURL
-         */
-        function getDataURL(imgType) {
-            if (!_canvasSupported) {
-                return '';
-            }
-            if (_chartList.length === 0) {
-                // 渲染为图片
-                var imgId = 'IMG' + self.id;
-                var img = document.getElementById(imgId);
-                if (img) {
-                    return img.src;
-                }
-            }
-            // 清除可能存在的tooltip元素
-            self.component.tooltip && self.component.tooltip.hideTip();
-                
-            imgType = imgType || 'png';
-            if (imgType != 'png' && imgType != 'jpeg') {
-                imgType = 'png';
-            }
-            var bgColor = _option.backgroundColor
-                          && _option.backgroundColor.replace(' ','') == 'rgba(0,0,0,0)'
-                              ? '#fff' : _option.backgroundColor;
-            return _zr.toDataURL('image/' + imgType, bgColor); 
-        }
+            doVisualEncoding.call(this, ecModel, payload);
 
-        /**
-         * 获取img
-         * @param {string} imgType 图片类型，支持png|jpeg，默认为png
-         * @return img dom
-         */
-        function getImage(imgType) {
-            var imgDom = document.createElement('img');
-            imgDom.src = getDataURL(imgType);
-            imgDom.title = (_optionRestore.title && _optionRestore.title.text)
-                           || 'ECharts';
-            return imgDom;
-        }
-        
-        /**
-         * 获取多图联动的Base64图片dataURL
-         * @param {string} imgType 图片类型，支持png|jpeg，默认为png
-         * @return imgDataURL
-         */
-        function getConnectedDataURL(imgType) {
-            if (!isConnected()) {
-                return getDataURL(imgType);
-            }
-            
-            var tempDom;
-            var domSize = [
-                dom.offsetLeft, dom.offsetTop, 
-                dom.offsetWidth, dom.offsetHeight
-            ];
-            var imgList = {
-                'self' : {
-                    img : self.getDataURL(imgType),
-                    left : domSize[0],
-                    top : domSize[1],
-                    right : domSize[0] + domSize[2],
-                    bottom : domSize[1] + domSize[3]
-                }
-            };
-            var minLeft = imgList.self.left;
-            var minTop = imgList.self.top;
-            var maxRight = imgList.self.right;
-            var maxBottom = imgList.self.bottom;
-            for (var c in _connected) {
-                tempDom = _connected[c].getDom();
-                domSize = [
-                    tempDom.offsetLeft, tempDom.offsetTop, 
-                    tempDom.offsetWidth, tempDom.offsetHeight
-                ];
-                imgList[c] = {
-                    img : _connected[c].getDataURL(imgType),
-                    left : domSize[0],
-                    top : domSize[1],
-                    right : domSize[0] + domSize[2],
-                    bottom : domSize[1] + domSize[3]
-                };
-                minLeft = Math.min(minLeft, imgList[c].left);
-                minTop = Math.min(minTop, imgList[c].top);
-                maxRight = Math.max(maxRight, imgList[c].right);
-                maxBottom = Math.max(maxBottom, imgList[c].bottom);
-            }
-            
-            var zrDom = document.createElement('div');
-            zrDom.style.position = 'absolute';
-            zrDom.style.left = '-4000px';
-            zrDom.style.width = (maxRight - minLeft) + 'px';
-            zrDom.style.height = (maxBottom - minTop) + 'px';
-            document.body.appendChild(zrDom);
-            
-            var zrImg = require('zrender').init(zrDom);
-            
-            for (var c in imgList) {
-                zrImg.addShape({
-                    shape:'image',
-                    style : {
-                        x : imgList[c].left - minLeft,
-                        y : imgList[c].top - minTop,
-                        image : imgList[c].img
-                    }
+            doRender.call(this, ecModel, payload);
+
+            // Set background
+            var backgroundColor = ecModel.get('backgroundColor') || 'transparent';
+
+            var painter = zr.painter;
+            // TODO all use clearColor ?
+            if (painter.isSingleCanvas && painter.isSingleCanvas()) {
+                zr.configLayer(0, {
+                    clearColor: backgroundColor
                 });
             }
-            
-            zrImg.render();
-            var bgColor = _option.backgroundColor 
-                          && _option.backgroundColor.replace(' ','') == 'rgba(0,0,0,0)'
-                          ? '#fff' : _option.backgroundColor;
-                          
-            var image = zrImg.toDataURL('image/png', bgColor);
-            
-            setTimeout(function(){
-                zrImg.dispose();
-                zrDom.parentNode.removeChild(zrDom);
-                zrDom = null;
-            },100);
-            
-            return image;
-        }
-        
-        /**
-         * 获取多图联动的img
-         * @param {string} imgType 图片类型，支持png|jpeg，默认为png
-         * @return img dom
-         */
-        function getConnectedImage(imgType) {
-            var imgDom = document.createElement('img');
-            imgDom.src = getConnectedDataURL(imgType);
-            imgDom.title = (_optionRestore.title && _optionRestore.title.text)
-                           || 'ECharts';
-            return imgDom;
-        }
-
-        /**
-         * 绑定事件
-         * @param {Object} eventName 事件名称
-         * @param {Object} eventListener 事件响应函数
-         */
-        function on(eventName, eventListener) {
-            _messageCenter.bind(eventName, eventListener);
-            return self;
-        }
-
-        /**
-         * 解除事件绑定
-         * @param {Object} eventName 事件名称
-         * @param {Object} eventListener 事件响应函数
-         */
-        function un(eventName, eventListener) {
-            _messageCenter.unbind(eventName, eventListener);
-            return self;
-        }
-        
-        /**
-         * 多图联动 
-         * @param connectTarget{ECharts | Array <ECharts>} connectTarget 联动目标
-         */
-        function connect(connectTarget) {
-            if (!connectTarget) {
-                return self;
-            }
-            
-            if (!_connected) {
-                _connected = {};
-            }
-            
-            if (connectTarget instanceof Array) {
-                for (var i = 0, l = connectTarget.length; i < l; i++) {
-                    _connected[connectTarget[i].id] = connectTarget[i];
-                }
-            }
             else {
-                _connected[connectTarget.id] = connectTarget;
-            }
-            
-            return self;
-        }
-        
-        /**
-         * 解除多图联动 
-         * @param connectTarget{ECharts | Array <ECharts>} connectTarget 解除联动目标
-         */
-        function disConnect(connectTarget) {
-            if (!connectTarget || !_connected) {
-                return self;
-            }
-            
-            if (connectTarget instanceof Array) {
-                for (var i = 0, l = connectTarget.length; i < l; i++) {
-                    delete _connected[connectTarget[i].id];
-                }
-            }
-            else {
-                delete _connected[connectTarget.id];
-            }
-            
-            for (var k in _connected) {
-                return k, self; // 非空
-            }
-            
-            // 空，转为标志位
-            _connected = false;
-            return self;
-        }
-        
-        /**
-         * 联动事件响应 
-         */
-        function connectedEventHandler(param) {
-            if (param.__echartsId != self.id) {
-                // 来自其他联动图表的事件
-                _onevent(param);
-            }
-        }
-        
-        /**
-         * 是否存在多图联动 
-         */
-        function isConnected() {
-            return !!_connected;
-        }
-        
-        /**
-         * 显示loading过渡 
-         * @param {Object} loadingOption
-         */
-        function showLoading(loadingOption) {
-            _toolbox.hideDataView();
-
-            var zrUtil = require('zrender/tool/util');
-            loadingOption = loadingOption || {};
-            loadingOption.textStyle = loadingOption.textStyle || {};
-
-            var finalTextStyle = zrUtil.merge(
-                zrUtil.clone(loadingOption.textStyle),
-                _themeConfig.textStyle,
-                { 'overwrite': false}
-            );
-            loadingOption.textStyle.textFont = finalTextStyle.fontStyle + ' '
-                                            + finalTextStyle.fontWeight + ' '
-                                            + finalTextStyle.fontSize + 'px '
-                                            + finalTextStyle.fontFamily;
-
-            loadingOption.textStyle.text = loadingOption.text 
-                                           || _themeConfig.loadingText;
-
-            if (typeof loadingOption.x != 'undefined') {
-                loadingOption.textStyle.x = loadingOption.x;
-            }
-
-            if (typeof loadingOption.y != 'undefined') {
-                loadingOption.textStyle.y = loadingOption.y;
-            }
-            _zr.showLoading(loadingOption);
-
-            return self;
-        }
-
-        /**
-         * 隐藏loading过渡 
-         */
-        function hideLoading() {
-            _zr.hideLoading();
-            return self;
-        }
-        
-        /**
-         * 主题设置 
-         */
-        function setTheme(theme) {
-            var zrUtil = require('zrender/tool/util');
-            if (theme) {
-               if (typeof theme === 'string') {
-                    // 默认主题
-                    switch (theme) {
-                        case 'default':
-                            theme = require('./theme/default');
-                            break;
-                        default:
-                            theme = require('./theme/default');
+                // In IE8
+                if (!env.canvasSupported) {
+                    var colorArr = colorTool.parse(backgroundColor);
+                    backgroundColor = colorTool.stringify(colorArr, 'rgb');
+                    if (colorArr[3] === 0) {
+                        backgroundColor = 'transparent';
                     }
                 }
+                if (backgroundColor.colorStops || backgroundColor.image) {
+                    // Gradient background
+                    // FIXME Fixed layer？
+                    zr.configLayer(0, {
+                        clearColor: backgroundColor
+                    });
+                    this[HAS_GRADIENT_OR_PATTERN_BG] = true;
+
+                    this._dom.style.background = 'transparent';
+                }
                 else {
-                    theme = theme || {};
+                    if (this[HAS_GRADIENT_OR_PATTERN_BG]) {
+                        zr.configLayer(0, {
+                            clearColor: null
+                        });
+                    }
+                    this[HAS_GRADIENT_OR_PATTERN_BG] = false;
+
+                    this._dom.style.background = backgroundColor;
                 }
-                
-                // 复位默认配置，别好心帮我改成_themeConfig = {};
-                for (var key in _themeConfig) {
-                    delete _themeConfig[key];
-                }
-                for (var key in ecConfig) {
-                    _themeConfig[key] = zrUtil.clone(ecConfig[key]);
-                }
-                if (theme.color) {
-                    // 颜色数组随theme，不merge
-                    _themeConfig.color = [];
-                }
-                
-                if (theme.symbolList) {
-                    // 默认标志图形类型列表，不merge
-                    _themeConfig.symbolList = [];
-                }
-                
-                // 应用新主题
-                zrUtil.merge(
-                    _themeConfig, zrUtil.clone(theme),
-                    { 'overwrite': true, 'recursive': true }
-                );
             }
-            
-            if (!_canvasSupported) {   // IE8-
-                _themeConfig.textStyle.fontFamily = 
-                    _themeConfig.textStyle.fontFamily2;
-            }
-            
-            _optionRestore && self.restore();
-        }
+
+            each(postUpdateFuncs, function (func) {
+                func(ecModel, api);
+            });
+
+            // console.profile && console.profileEnd('update');
+        },
 
         /**
-         * 视图区域大小变化更新，不默认绑定，供使用方按需调用 
+         * @param {Object} payload
+         * @private
          */
-        function resize() {
-            _zr.resize();
-            if (_option.renderAsImage && _canvasSupported) {
-                // 渲染为图片重走render模式
-                _render(_option);
-                return self;
+        updateView: function (payload) {
+            var ecModel = this._model;
+
+            // update before setOption
+            if (!ecModel) {
+                return;
             }
-            // 停止动画
-            _zr.clearAnimation();
-            _island.resize();
-            _toolbox.resize();
-            // 先来后到，不能仅刷新自己，也不能在上一个循环中刷新，如坐标系数据改变会影响其他图表的大小
-            // 所以安顺序刷新各种图表，图表内部refresh优化无需更新则不更新~
-            for (var i = 0, l = _chartList.length; i < l; i++) {
-                _chartList[i].resize && _chartList[i].resize();
-            }
-            _zr.refresh();
-            _messageCenter.dispatch(
-                ecConfig.EVENT.RESIZE
-            );
-            return self;
-        }
-        
-        /**
-         * 清楚已渲染内容 ，clear后echarts实例可用
-         */
-        function clear() {
-            _disposeChartList();
-            _zr.clear();
-            _option = {};
-            _optionBackup = {};
-            _optionRestore = {};
-            return self;
-        }
+
+            ecModel.eachSeries(function (seriesModel) {
+                seriesModel.getData().clearAllVisual();
+            });
+
+            doVisualEncoding.call(this, ecModel, payload);
+
+            invokeUpdateMethod.call(this, 'updateView', ecModel, payload);
+        },
 
         /**
-         * 释放，dispose后echarts实例不可用
+         * @param {Object} payload
+         * @private
          */
-        function dispose() {
-            var key = dom.getAttribute(DOM_ATTRIBUTE_KEY);
-            key && delete _instances[key];
-        
-            _island.dispose();
-            _toolbox.dispose();
-            _messageCenter.unbind();
-            self.clear();
-            _zr.dispose();
-            _zr = null;
-            self = null;
+        updateVisual: function (payload) {
+            var ecModel = this._model;
+
+            // update before setOption
+            if (!ecModel) {
+                return;
+            }
+
+            ecModel.eachSeries(function (seriesModel) {
+                seriesModel.getData().clearAllVisual();
+            });
+
+            doVisualEncoding.call(this, ecModel, payload, true);
+
+            invokeUpdateMethod.call(this, 'updateVisual', ecModel, payload);
+        },
+
+        /**
+         * @param {Object} payload
+         * @private
+         */
+        updateLayout: function (payload) {
+            var ecModel = this._model;
+
+            // update before setOption
+            if (!ecModel) {
+                return;
+            }
+
+            doLayout.call(this, ecModel, payload);
+
+            invokeUpdateMethod.call(this, 'updateLayout', ecModel, payload);
+        },
+
+        /**
+         * @param {Object} payload
+         * @private
+         */
+        prepareAndUpdate: function (payload) {
+            var ecModel = this._model;
+
+            prepareView.call(this, 'component', ecModel);
+
+            prepareView.call(this, 'chart', ecModel);
+
+            updateMethods.update.call(this, payload);
+        }
+    };
+
+    /**
+     * @private
+     */
+    function updateDirectly(ecIns, method, payload, mainType, subType) {
+        var ecModel = ecIns._model;
+
+        // broadcast
+        if (!mainType) {
+            each(ecIns._componentsViews.concat(ecIns._chartsViews), callView);
             return;
         }
 
-        // 接口方法暴漏
-        self.setOption = setOption;
-        self.setSeries = setSeries;
-        self.addData = addData;
-        self.getOption = getOption;
-        self.getSeries = getSeries;
-        self.getDom = getDom;
-        self.getZrender = getZrender;
-        self.getDataURL = getDataURL;
-        self.getImage =  getImage;
-        self.getConnectedDataURL = getConnectedDataURL;
-        self.getConnectedImage = getConnectedImage;
-        self.on = on;
-        self.un = un;
-        self.connect = connect;
-        self.disConnect = disConnect;
-        self.connectedEventHandler = connectedEventHandler;
-        self.isConnected = isConnected;
-        self.showLoading = showLoading;
-        self.hideLoading = hideLoading;
-        self.setTheme = setTheme;
-        self.resize = resize;
-        self.refresh = refresh;
-        self.restore = restore;
-        self.clear = clear;
-        self.dispose = dispose;
+        var query = {};
+        query[mainType + 'Id'] = payload[mainType + 'Id'];
+        query[mainType + 'Index'] = payload[mainType + 'Index'];
+        query[mainType + 'Name'] = payload[mainType + 'Name'];
+
+        var condition = {mainType: mainType, query: query};
+        subType && (condition.subType = subType); // subType may be '' by parseClassType;
+
+        // If dispatchAction before setOption, do nothing.
+        ecModel && ecModel.eachComponent(condition, function (model, index) {
+            callView(ecIns[
+                mainType === 'series' ? '_chartsMap' : '_componentsMap'
+            ][model.__viewId]);
+        }, ecIns);
+
+        function callView(view) {
+            view && view.__alive && view[method] && view[method](
+                view.__model, ecModel, ecIns._api, payload
+            );
+        }
     }
 
-    return self;
+    /**
+     * Resize the chart
+     * @param {Object} opts
+     * @param {number} [opts.width] Can be 'auto' (the same as null/undefined)
+     * @param {number} [opts.height] Can be 'auto' (the same as null/undefined)
+     * @param {boolean} [opts.silent=false]
+     */
+    echartsProto.resize = function (opts) {
+        if (__DEV__) {
+            zrUtil.assert(!this[IN_MAIN_PROCESS], '`resize` should not be called during main process.');
+        }
+
+        this[IN_MAIN_PROCESS] = true;
+
+        this._zr.resize(opts);
+
+        var optionChanged = this._model && this._model.resetOption('media');
+        var updateMethod = optionChanged ? 'prepareAndUpdate' : 'update';
+
+        updateMethods[updateMethod].call(this);
+
+        // Resize loading effect
+        this._loadingFX && this._loadingFX.resize();
+
+        this[IN_MAIN_PROCESS] = false;
+
+        var silent = opts && opts.silent;
+
+        flushPendingActions.call(this, silent);
+
+        triggerUpdatedEvent.call(this, silent);
+    };
+
+    /**
+     * Show loading effect
+     * @param  {string} [name='default']
+     * @param  {Object} [cfg]
+     */
+    echartsProto.showLoading = function (name, cfg) {
+        if (zrUtil.isObject(name)) {
+            cfg = name;
+            name = '';
+        }
+        name = name || 'default';
+
+        this.hideLoading();
+        if (!loadingEffects[name]) {
+            if (__DEV__) {
+                console.warn('Loading effects ' + name + ' not exists.');
+            }
+            return;
+        }
+        var el = loadingEffects[name](this._api, cfg);
+        var zr = this._zr;
+        this._loadingFX = el;
+
+        zr.add(el);
+    };
+
+    /**
+     * Hide loading effect
+     */
+    echartsProto.hideLoading = function () {
+        this._loadingFX && this._zr.remove(this._loadingFX);
+        this._loadingFX = null;
+    };
+
+    /**
+     * @param {Object} eventObj
+     * @return {Object}
+     */
+    echartsProto.makeActionFromEvent = function (eventObj) {
+        var payload = zrUtil.extend({}, eventObj);
+        payload.type = eventActionMap[eventObj.type];
+        return payload;
+    };
+
+    /**
+     * @pubilc
+     * @param {Object} payload
+     * @param {string} [payload.type] Action type
+     * @param {Object|boolean} [opt] If pass boolean, means opt.silent
+     * @param {boolean} [opt.silent=false] Whether trigger events.
+     * @param {boolean} [opt.flush=undefined]
+     *                  true: Flush immediately, and then pixel in canvas can be fetched
+     *                      immediately. Caution: it might affect performance.
+     *                  false: Not not flush.
+     *                  undefined: Auto decide whether perform flush.
+     */
+    echartsProto.dispatchAction = function (payload, opt) {
+        if (!zrUtil.isObject(opt)) {
+            opt = {silent: !!opt};
+        }
+
+        if (!actions[payload.type]) {
+            return;
+        }
+
+        // May dispatchAction in rendering procedure
+        if (this[IN_MAIN_PROCESS]) {
+            this._pendingActions.push(payload);
+            return;
+        }
+
+        doDispatchAction.call(this, payload, opt.silent);
+
+        if (opt.flush) {
+            this._zr.flush(true);
+        }
+        else if (opt.flush !== false && env.browser.weChat) {
+            // In WeChat embeded browser, `requestAnimationFrame` and `setInterval`
+            // hang when sliding page (on touch event), which cause that zr does not
+            // refresh util user interaction finished, which is not expected.
+            // But `dispatchAction` may be called too frequently when pan on touch
+            // screen, which impacts performance if do not throttle them.
+            this._throttledZrFlush();
+        }
+
+        flushPendingActions.call(this, opt.silent);
+
+        triggerUpdatedEvent.call(this, opt.silent);
+    };
+
+    function doDispatchAction(payload, silent) {
+        var payloadType = payload.type;
+        var escapeConnect = payload.escapeConnect;
+        var actionWrap = actions[payloadType];
+        var actionInfo = actionWrap.actionInfo;
+
+        var cptType = (actionInfo.update || 'update').split(':');
+        var updateMethod = cptType.pop();
+        cptType = cptType[0] != null && parseClassType(cptType[0]);
+
+        this[IN_MAIN_PROCESS] = true;
+
+        var payloads = [payload];
+        var batched = false;
+        // Batch action
+        if (payload.batch) {
+            batched = true;
+            payloads = zrUtil.map(payload.batch, function (item) {
+                item = zrUtil.defaults(zrUtil.extend({}, item), payload);
+                item.batch = null;
+                return item;
+            });
+        }
+
+        var eventObjBatch = [];
+        var eventObj;
+        var isHighDown = payloadType === 'highlight' || payloadType === 'downplay';
+
+        each(payloads, function (batchItem) {
+            // Action can specify the event by return it.
+            eventObj = actionWrap.action(batchItem, this._model, this._api);
+            // Emit event outside
+            eventObj = eventObj || zrUtil.extend({}, batchItem);
+            // Convert type to eventType
+            eventObj.type = actionInfo.event || eventObj.type;
+            eventObjBatch.push(eventObj);
+
+            // light update does not perform data process, layout and visual.
+            if (isHighDown) {
+                // method, payload, mainType, subType
+                updateDirectly(this, updateMethod, batchItem, 'series');
+            }
+            else if (cptType) {
+                updateDirectly(this, updateMethod, batchItem, cptType.main, cptType.sub);
+            }
+        }, this);
+
+        if (updateMethod !== 'none' && !isHighDown && !cptType) {
+            // Still dirty
+            if (this[OPTION_UPDATED]) {
+                // FIXME Pass payload ?
+                updateMethods.prepareAndUpdate.call(this, payload);
+                this[OPTION_UPDATED] = false;
+            }
+            else {
+                updateMethods[updateMethod].call(this, payload);
+            }
+        }
+
+        // Follow the rule of action batch
+        if (batched) {
+            eventObj = {
+                type: actionInfo.event || payloadType,
+                escapeConnect: escapeConnect,
+                batch: eventObjBatch
+            };
+        }
+        else {
+            eventObj = eventObjBatch[0];
+        }
+
+        this[IN_MAIN_PROCESS] = false;
+
+        !silent && this._messageCenter.trigger(eventObj.type, eventObj);
+    }
+
+    function flushPendingActions(silent) {
+        var pendingActions = this._pendingActions;
+        while (pendingActions.length) {
+            var payload = pendingActions.shift();
+            doDispatchAction.call(this, payload, silent);
+        }
+    }
+
+    function triggerUpdatedEvent(silent) {
+        !silent && this.trigger('updated');
+    }
+
+    /**
+     * Register event
+     * @method
+     */
+    echartsProto.on = createRegisterEventWithLowercaseName('on');
+    echartsProto.off = createRegisterEventWithLowercaseName('off');
+    echartsProto.one = createRegisterEventWithLowercaseName('one');
+
+    /**
+     * @param {string} methodName
+     * @private
+     */
+    function invokeUpdateMethod(methodName, ecModel, payload) {
+        var api = this._api;
+
+        // Update all components
+        each(this._componentsViews, function (component) {
+            var componentModel = component.__model;
+            component[methodName](componentModel, ecModel, api, payload);
+
+            updateZ(componentModel, component);
+        }, this);
+
+        // Upate all charts
+        ecModel.eachSeries(function (seriesModel, idx) {
+            var chart = this._chartsMap[seriesModel.__viewId];
+            chart[methodName](seriesModel, ecModel, api, payload);
+
+            updateZ(seriesModel, chart);
+
+            updateProgressiveAndBlend(seriesModel, chart);
+        }, this);
+
+        // If use hover layer
+        updateHoverLayerStatus(this._zr, ecModel);
+
+        // Post render
+        each(postUpdateFuncs, function (func) {
+            func(ecModel, api);
+        });
+    }
+
+    /**
+     * Prepare view instances of charts and components
+     * @param  {module:echarts/model/Global} ecModel
+     * @private
+     */
+    function prepareView(type, ecModel) {
+        var isComponent = type === 'component';
+        var viewList = isComponent ? this._componentsViews : this._chartsViews;
+        var viewMap = isComponent ? this._componentsMap : this._chartsMap;
+        var zr = this._zr;
+
+        for (var i = 0; i < viewList.length; i++) {
+            viewList[i].__alive = false;
+        }
+
+        ecModel[isComponent ? 'eachComponent' : 'eachSeries'](function (componentType, model) {
+            if (isComponent) {
+                if (componentType === 'series') {
+                    return;
+                }
+            }
+            else {
+                model = componentType;
+            }
+
+            // Consider: id same and type changed.
+            var viewId = '_ec_' + model.id + '_' + model.type;
+            var view = viewMap[viewId];
+            if (!view) {
+                var classType = parseClassType(model.type);
+                var Clazz = isComponent
+                    ? ComponentView.getClass(classType.main, classType.sub)
+                    : ChartView.getClass(classType.sub);
+                if (Clazz) {
+                    view = new Clazz();
+                    view.init(ecModel, this._api);
+                    viewMap[viewId] = view;
+                    viewList.push(view);
+                    zr.add(view.group);
+                }
+                else {
+                    // Error
+                    return;
+                }
+            }
+
+            model.__viewId = view.__id = viewId;
+            view.__alive = true;
+            view.__model = model;
+            view.group.__ecComponentInfo = {
+                mainType: model.mainType,
+                index: model.componentIndex
+            };
+        }, this);
+
+        for (var i = 0; i < viewList.length;) {
+            var view = viewList[i];
+            if (!view.__alive) {
+                zr.remove(view.group);
+                view.dispose(ecModel, this._api);
+                viewList.splice(i, 1);
+                delete viewMap[view.__id];
+                view.__id = view.group.__ecComponentInfo = null;
+            }
+            else {
+                i++;
+            }
+        }
+    }
+
+    /**
+     * Processor data in each series
+     *
+     * @param {module:echarts/model/Global} ecModel
+     * @private
+     */
+    function processData(ecModel, api) {
+        each(dataProcessorFuncs, function (process) {
+            process.func(ecModel, api);
+        });
+    }
+
+    /**
+     * @private
+     */
+    function stackSeriesData(ecModel) {
+        var stackedDataMap = {};
+        ecModel.eachSeries(function (series) {
+            var stack = series.get('stack');
+            var data = series.getData();
+            if (stack && data.type === 'list') {
+                var previousStack = stackedDataMap[stack];
+                // Avoid conflict with Object.prototype
+                if (stackedDataMap.hasOwnProperty(stack) && previousStack) {
+                    data.stackedOn = previousStack;
+                }
+                stackedDataMap[stack] = data;
+            }
+        });
+    }
+
+    /**
+     * Layout before each chart render there series, special visual encoding stage
+     *
+     * @param {module:echarts/model/Global} ecModel
+     * @private
+     */
+    function doLayout(ecModel, payload) {
+        var api = this._api;
+        each(visualFuncs, function (visual) {
+            if (visual.isLayout) {
+                visual.func(ecModel, api, payload);
+            }
+        });
+    }
+
+    /**
+     * Encode visual infomation from data after data processing
+     *
+     * @param {module:echarts/model/Global} ecModel
+     * @param {object} layout
+     * @param {boolean} [excludesLayout]
+     * @private
+     */
+    function doVisualEncoding(ecModel, payload, excludesLayout) {
+        var api = this._api;
+        ecModel.clearColorPalette();
+        ecModel.eachSeries(function (seriesModel) {
+            seriesModel.clearColorPalette();
+        });
+        each(visualFuncs, function (visual) {
+            (!excludesLayout || !visual.isLayout)
+                && visual.func(ecModel, api, payload);
+        });
+    }
+
+    /**
+     * Render each chart and component
+     * @private
+     */
+    function doRender(ecModel, payload) {
+        var api = this._api;
+        // Render all components
+        each(this._componentsViews, function (componentView) {
+            var componentModel = componentView.__model;
+            componentView.render(componentModel, ecModel, api, payload);
+
+            updateZ(componentModel, componentView);
+        }, this);
+
+        each(this._chartsViews, function (chart) {
+            chart.__alive = false;
+        }, this);
+
+        // Render all charts
+        ecModel.eachSeries(function (seriesModel, idx) {
+            var chartView = this._chartsMap[seriesModel.__viewId];
+            chartView.__alive = true;
+            chartView.render(seriesModel, ecModel, api, payload);
+
+            chartView.group.silent = !!seriesModel.get('silent');
+
+            updateZ(seriesModel, chartView);
+
+            updateProgressiveAndBlend(seriesModel, chartView);
+
+        }, this);
+
+        // If use hover layer
+        updateHoverLayerStatus(this._zr, ecModel);
+
+        // Remove groups of unrendered charts
+        each(this._chartsViews, function (chart) {
+            if (!chart.__alive) {
+                chart.remove(ecModel, api);
+            }
+        }, this);
+    }
+
+    var MOUSE_EVENT_NAMES = [
+        'click', 'dblclick', 'mouseover', 'mouseout', 'mousemove',
+        'mousedown', 'mouseup', 'globalout', 'contextmenu'
+    ];
+    /**
+     * @private
+     */
+    echartsProto._initEvents = function () {
+        each(MOUSE_EVENT_NAMES, function (eveName) {
+            this._zr.on(eveName, function (e) {
+                var ecModel = this.getModel();
+                var el = e.target;
+                var params;
+
+                // no e.target when 'globalout'.
+                if (eveName === 'globalout') {
+                    params = {};
+                }
+                else if (el && el.dataIndex != null) {
+                    var dataModel = el.dataModel || ecModel.getSeriesByIndex(el.seriesIndex);
+                    params = dataModel && dataModel.getDataParams(el.dataIndex, el.dataType) || {};
+                }
+                // If element has custom eventData of components
+                else if (el && el.eventData) {
+                    params = zrUtil.extend({}, el.eventData);
+                }
+
+                if (params) {
+                    params.event = e;
+                    params.type = eveName;
+                    this.trigger(eveName, params);
+                }
+
+            }, this);
+        }, this);
+
+        each(eventActionMap, function (actionType, eventType) {
+            this._messageCenter.on(eventType, function (event) {
+                this.trigger(eventType, event);
+            }, this);
+        }, this);
+    };
+
+    /**
+     * @return {boolean}
+     */
+    echartsProto.isDisposed = function () {
+        return this._disposed;
+    };
+
+    /**
+     * Clear
+     */
+    echartsProto.clear = function () {
+        this.setOption({ series: [] }, true);
+    };
+
+    /**
+     * Dispose instance
+     */
+    echartsProto.dispose = function () {
+        if (this._disposed) {
+            if (__DEV__) {
+                console.warn('Instance ' + this.id + ' has been disposed');
+            }
+            return;
+        }
+        this._disposed = true;
+
+        var api = this._api;
+        var ecModel = this._model;
+
+        each(this._componentsViews, function (component) {
+            component.dispose(ecModel, api);
+        });
+        each(this._chartsViews, function (chart) {
+            chart.dispose(ecModel, api);
+        });
+
+        // Dispose after all views disposed
+        this._zr.dispose();
+
+        delete instances[this.id];
+    };
+
+    zrUtil.mixin(ECharts, Eventful);
+
+    function updateHoverLayerStatus(zr, ecModel) {
+        var storage = zr.storage;
+        var elCount = 0;
+        storage.traverse(function (el) {
+            if (!el.isGroup) {
+                elCount++;
+            }
+        });
+        if (elCount > ecModel.get('hoverLayerThreshold') && !env.node) {
+            storage.traverse(function (el) {
+                if (!el.isGroup) {
+                    el.useHoverLayer = true;
+                }
+            });
+        }
+    }
+
+    /**
+     * Update chart progressive and blend.
+     * @param {module:echarts/model/Series|module:echarts/model/Component} model
+     * @param {module:echarts/view/Component|module:echarts/view/Chart} view
+     */
+    function updateProgressiveAndBlend(seriesModel, chartView) {
+        // Progressive configuration
+        var elCount = 0;
+        chartView.group.traverse(function (el) {
+            if (el.type !== 'group' && !el.ignore) {
+                elCount++;
+            }
+        });
+        var frameDrawNum = +seriesModel.get('progressive');
+        var needProgressive = elCount > seriesModel.get('progressiveThreshold') && frameDrawNum && !env.node;
+        if (needProgressive) {
+            chartView.group.traverse(function (el) {
+                // FIXME marker and other components
+                if (!el.isGroup) {
+                    el.progressive = needProgressive ?
+                        Math.floor(elCount++ / frameDrawNum) : -1;
+                    if (needProgressive) {
+                        el.stopAnimation(true);
+                    }
+                }
+            });
+        }
+
+        // Blend configration
+        var blendMode = seriesModel.get('blendMode') || null;
+        if (__DEV__) {
+            if (!env.canvasSupported && blendMode && blendMode !== 'source-over') {
+                console.warn('Only canvas support blendMode');
+            }
+        }
+        chartView.group.traverse(function (el) {
+            // FIXME marker and other components
+            if (!el.isGroup) {
+                el.setStyle('blend', blendMode);
+            }
+        });
+    }
+
+    /**
+     * @param {module:echarts/model/Series|module:echarts/model/Component} model
+     * @param {module:echarts/view/Component|module:echarts/view/Chart} view
+     */
+    function updateZ(model, view) {
+        var z = model.get('z');
+        var zlevel = model.get('zlevel');
+        // Set z and zlevel
+        view.group.traverse(function (el) {
+            if (el.type !== 'group') {
+                z != null && (el.z = z);
+                zlevel != null && (el.zlevel = zlevel);
+            }
+        });
+    }
+
+    function createExtensionAPI(ecInstance) {
+        var coordSysMgr = ecInstance._coordSysMgr;
+        return zrUtil.extend(new ExtensionAPI(ecInstance), {
+            // Inject methods
+            getCoordinateSystems: zrUtil.bind(
+                coordSysMgr.getCoordinateSystems, coordSysMgr
+            ),
+            getComponentByElement: function (el) {
+                while (el) {
+                    var modelInfo = el.__ecComponentInfo;
+                    if (modelInfo != null) {
+                        return ecInstance._model.getComponent(modelInfo.mainType, modelInfo.index);
+                    }
+                    el = el.parent;
+                }
+            }
+        });
+    }
+
+    /**
+     * @type {Object} key: actionType.
+     * @inner
+     */
+    var actions = {};
+
+    /**
+     * Map eventType to actionType
+     * @type {Object}
+     */
+    var eventActionMap = {};
+
+    /**
+     * Data processor functions of each stage
+     * @type {Array.<Object.<string, Function>>}
+     * @inner
+     */
+    var dataProcessorFuncs = [];
+
+    /**
+     * @type {Array.<Function>}
+     * @inner
+     */
+    var optionPreprocessorFuncs = [];
+
+    /**
+     * @type {Array.<Function>}
+     * @inner
+     */
+    var postUpdateFuncs = [];
+
+    /**
+     * Visual encoding functions of each stage
+     * @type {Array.<Object.<string, Function>>}
+     * @inner
+     */
+    var visualFuncs = [];
+    /**
+     * Theme storage
+     * @type {Object.<key, Object>}
+     */
+    var themeStorage = {};
+    /**
+     * Loading effects
+     */
+    var loadingEffects = {};
+
+
+    var instances = {};
+    var connectedGroups = {};
+
+    var idBase = new Date() - 0;
+    var groupIdBase = new Date() - 0;
+    var DOM_ATTRIBUTE_KEY = '_echarts_instance_';
+
+    /**
+     * @alias module:echarts
+     */
+    var echarts = {
+        /**
+         * @type {number}
+         */
+        version: '3.6.0',
+        dependencies: {
+            zrender: '3.5.0'
+        }
+    };
+
+    function enableConnect(chart) {
+        var STATUS_PENDING = 0;
+        var STATUS_UPDATING = 1;
+        var STATUS_UPDATED = 2;
+        var STATUS_KEY = '__connectUpdateStatus';
+
+        function updateConnectedChartsStatus(charts, status) {
+            for (var i = 0; i < charts.length; i++) {
+                var otherChart = charts[i];
+                otherChart[STATUS_KEY] = status;
+            }
+        }
+
+        zrUtil.each(eventActionMap, function (actionType, eventType) {
+            chart._messageCenter.on(eventType, function (event) {
+                if (connectedGroups[chart.group] && chart[STATUS_KEY] !== STATUS_PENDING) {
+                    if (event && event.escapeConnect) {
+                        return;
+                    }
+
+                    var action = chart.makeActionFromEvent(event);
+                    var otherCharts = [];
+
+                    zrUtil.each(instances, function (otherChart) {
+                        if (otherChart !== chart && otherChart.group === chart.group) {
+                            otherCharts.push(otherChart);
+                        }
+                    });
+
+                    updateConnectedChartsStatus(otherCharts, STATUS_PENDING);
+                    each(otherCharts, function (otherChart) {
+                        if (otherChart[STATUS_KEY] !== STATUS_UPDATING) {
+                            otherChart.dispatchAction(action);
+                        }
+                    });
+                    updateConnectedChartsStatus(otherCharts, STATUS_UPDATED);
+                }
+            });
+        });
+    }
+
+    /**
+     * @param {HTMLDomElement} dom
+     * @param {Object} [theme]
+     * @param {Object} opts
+     * @param {number} [opts.devicePixelRatio] Use window.devicePixelRatio by default
+     * @param {string} [opts.renderer] Currently only 'canvas' is supported.
+     * @param {number} [opts.width] Use clientWidth of the input `dom` by default.
+     *                              Can be 'auto' (the same as null/undefined)
+     * @param {number} [opts.height] Use clientHeight of the input `dom` by default.
+     *                               Can be 'auto' (the same as null/undefined)
+     */
+    echarts.init = function (dom, theme, opts) {
+        if (__DEV__) {
+            // Check version
+            if ((zrender.version.replace('.', '') - 0) < (echarts.dependencies.zrender.replace('.', '') - 0)) {
+                throw new Error(
+                    'ZRender ' + zrender.version
+                    + ' is too old for ECharts ' + echarts.version
+                    + '. Current version need ZRender '
+                    + echarts.dependencies.zrender + '+'
+                );
+            }
+
+            if (!dom) {
+                throw new Error('Initialize failed: invalid dom.');
+            }
+        }
+
+        var existInstance = echarts.getInstanceByDom(dom);
+        if (existInstance) {
+            if (__DEV__) {
+                console.warn('There is a chart instance already initialized on the dom.');
+            }
+            return existInstance;
+        }
+
+        if (__DEV__) {
+            if (zrUtil.isDom(dom)
+                && dom.nodeName.toUpperCase() !== 'CANVAS'
+                && (
+                    (!dom.clientWidth && (!opts || opts.width == null))
+                    || (!dom.clientHeight && (!opts || opts.height == null))
+                )
+            ) {
+                console.warn('Can\'t get dom width or height');
+            }
+        }
+
+        var chart = new ECharts(dom, theme, opts);
+        chart.id = 'ec_' + idBase++;
+        instances[chart.id] = chart;
+
+        if (dom.setAttribute) {
+            dom.setAttribute(DOM_ATTRIBUTE_KEY, chart.id);
+        }
+        else {
+            dom[DOM_ATTRIBUTE_KEY] = chart.id;
+        }
+
+        enableConnect(chart);
+
+        return chart;
+    };
+
+    /**
+     * @return {string|Array.<module:echarts~ECharts>} groupId
+     */
+    echarts.connect = function (groupId) {
+        // Is array of charts
+        if (zrUtil.isArray(groupId)) {
+            var charts = groupId;
+            groupId = null;
+            // If any chart has group
+            zrUtil.each(charts, function (chart) {
+                if (chart.group != null) {
+                    groupId = chart.group;
+                }
+            });
+            groupId = groupId || ('g_' + groupIdBase++);
+            zrUtil.each(charts, function (chart) {
+                chart.group = groupId;
+            });
+        }
+        connectedGroups[groupId] = true;
+        return groupId;
+    };
+
+    /**
+     * @DEPRECATED
+     * @return {string} groupId
+     */
+    echarts.disConnect = function (groupId) {
+        connectedGroups[groupId] = false;
+    };
+
+    /**
+     * @return {string} groupId
+     */
+    echarts.disconnect = echarts.disConnect;
+
+    /**
+     * Dispose a chart instance
+     * @param  {module:echarts~ECharts|HTMLDomElement|string} chart
+     */
+    echarts.dispose = function (chart) {
+        if (typeof chart === 'string') {
+            chart = instances[chart];
+        }
+        else if (!(chart instanceof ECharts)){
+            // Try to treat as dom
+            chart = echarts.getInstanceByDom(chart);
+        }
+        if ((chart instanceof ECharts) && !chart.isDisposed()) {
+            chart.dispose();
+        }
+    };
+
+    /**
+     * @param  {HTMLDomElement} dom
+     * @return {echarts~ECharts}
+     */
+    echarts.getInstanceByDom = function (dom) {
+        var key;
+        if (dom.getAttribute) {
+            key = dom.getAttribute(DOM_ATTRIBUTE_KEY);
+        }
+        else {
+            key = dom[DOM_ATTRIBUTE_KEY];
+        }
+        return instances[key];
+    };
+
+    /**
+     * @param {string} key
+     * @return {echarts~ECharts}
+     */
+    echarts.getInstanceById = function (key) {
+        return instances[key];
+    };
+
+    /**
+     * Register theme
+     */
+    echarts.registerTheme = function (name, theme) {
+        themeStorage[name] = theme;
+    };
+
+    /**
+     * Register option preprocessor
+     * @param {Function} preprocessorFunc
+     */
+    echarts.registerPreprocessor = function (preprocessorFunc) {
+        optionPreprocessorFuncs.push(preprocessorFunc);
+    };
+
+    /**
+     * @param {number} [priority=1000]
+     * @param {Function} processorFunc
+     */
+    echarts.registerProcessor = function (priority, processorFunc) {
+        if (typeof priority === 'function') {
+            processorFunc = priority;
+            priority = PRIORITY_PROCESSOR_FILTER;
+        }
+        if (__DEV__) {
+            if (isNaN(priority)) {
+                throw new Error('Unkown processor priority');
+            }
+        }
+        dataProcessorFuncs.push({
+            prio: priority,
+            func: processorFunc
+        });
+    };
+
+    /**
+     * Register postUpdater
+     * @param {Function} postUpdateFunc
+     */
+    echarts.registerPostUpdate = function (postUpdateFunc) {
+        postUpdateFuncs.push(postUpdateFunc);
+    };
+
+    /**
+     * Usage:
+     * registerAction('someAction', 'someEvent', function () { ... });
+     * registerAction('someAction', function () { ... });
+     * registerAction(
+     *     {type: 'someAction', event: 'someEvent', update: 'updateView'},
+     *     function () { ... }
+     * );
+     *
+     * @param {(string|Object)} actionInfo
+     * @param {string} actionInfo.type
+     * @param {string} [actionInfo.event]
+     * @param {string} [actionInfo.update]
+     * @param {string} [eventName]
+     * @param {Function} action
+     */
+    echarts.registerAction = function (actionInfo, eventName, action) {
+        if (typeof eventName === 'function') {
+            action = eventName;
+            eventName = '';
+        }
+        var actionType = zrUtil.isObject(actionInfo)
+            ? actionInfo.type
+            : ([actionInfo, actionInfo = {
+                event: eventName
+            }][0]);
+
+        // Event name is all lowercase
+        actionInfo.event = (actionInfo.event || actionType).toLowerCase();
+        eventName = actionInfo.event;
+
+        // Validate action type and event name.
+        zrUtil.assert(ACTION_REG.test(actionType) && ACTION_REG.test(eventName));
+
+        if (!actions[actionType]) {
+            actions[actionType] = {action: action, actionInfo: actionInfo};
+        }
+        eventActionMap[eventName] = actionType;
+    };
+
+    /**
+     * @param {string} type
+     * @param {*} CoordinateSystem
+     */
+    echarts.registerCoordinateSystem = function (type, CoordinateSystem) {
+        CoordinateSystemManager.register(type, CoordinateSystem);
+    };
+
+    /**
+     * Layout is a special stage of visual encoding
+     * Most visual encoding like color are common for different chart
+     * But each chart has it's own layout algorithm
+     *
+     * @param {number} [priority=1000]
+     * @param {Function} layoutFunc
+     */
+    echarts.registerLayout = function (priority, layoutFunc) {
+        if (typeof priority === 'function') {
+            layoutFunc = priority;
+            priority = PRIORITY_VISUAL_LAYOUT;
+        }
+        if (__DEV__) {
+            if (isNaN(priority)) {
+                throw new Error('Unkown layout priority');
+            }
+        }
+        visualFuncs.push({
+            prio: priority,
+            func: layoutFunc,
+            isLayout: true
+        });
+    };
+
+    /**
+     * @param {number} [priority=3000]
+     * @param {Function} visualFunc
+     */
+    echarts.registerVisual = function (priority, visualFunc) {
+        if (typeof priority === 'function') {
+            visualFunc = priority;
+            priority = PRIORITY_VISUAL_CHART;
+        }
+        if (__DEV__) {
+            if (isNaN(priority)) {
+                throw new Error('Unkown visual priority');
+            }
+        }
+        visualFuncs.push({
+            prio: priority,
+            func: visualFunc
+        });
+    };
+
+    /**
+     * @param {string} name
+     */
+    echarts.registerLoading = function (name, loadingFx) {
+        loadingEffects[name] = loadingFx;
+    };
+
+    /**
+     * @param {Object} opts
+     * @param {string} [superClass]
+     */
+    echarts.extendComponentModel = function (opts/*, superClass*/) {
+        // var Clazz = ComponentModel;
+        // if (superClass) {
+        //     var classType = parseClassType(superClass);
+        //     Clazz = ComponentModel.getClass(classType.main, classType.sub, true);
+        // }
+        return ComponentModel.extend(opts);
+    };
+
+    /**
+     * @param {Object} opts
+     * @param {string} [superClass]
+     */
+    echarts.extendComponentView = function (opts/*, superClass*/) {
+        // var Clazz = ComponentView;
+        // if (superClass) {
+        //     var classType = parseClassType(superClass);
+        //     Clazz = ComponentView.getClass(classType.main, classType.sub, true);
+        // }
+        return ComponentView.extend(opts);
+    };
+
+    /**
+     * @param {Object} opts
+     * @param {string} [superClass]
+     */
+    echarts.extendSeriesModel = function (opts/*, superClass*/) {
+        // var Clazz = SeriesModel;
+        // if (superClass) {
+        //     superClass = 'series.' + superClass.replace('series.', '');
+        //     var classType = parseClassType(superClass);
+        //     Clazz = ComponentModel.getClass(classType.main, classType.sub, true);
+        // }
+        return SeriesModel.extend(opts);
+    };
+
+    /**
+     * @param {Object} opts
+     * @param {string} [superClass]
+     */
+    echarts.extendChartView = function (opts/*, superClass*/) {
+        // var Clazz = ChartView;
+        // if (superClass) {
+        //     superClass = superClass.replace('series.', '');
+        //     var classType = parseClassType(superClass);
+        //     Clazz = ChartView.getClass(classType.main, true);
+        // }
+        return ChartView.extend(opts);
+    };
+
+    /**
+     * ZRender need a canvas context to do measureText.
+     * But in node environment canvas may be created by node-canvas.
+     * So we need to specify how to create a canvas instead of using document.createElement('canvas')
+     *
+     * Be careful of using it in the browser.
+     *
+     * @param {Function} creator
+     * @example
+     *     var Canvas = require('canvas');
+     *     var echarts = require('echarts');
+     *     echarts.setCanvasCreator(function () {
+     *         // Small size is enough.
+     *         return new Canvas(32, 32);
+     *     });
+     */
+    echarts.setCanvasCreator = function (creator) {
+        zrUtil.createCanvas = creator;
+    };
+
+    echarts.registerVisual(PRIORITY_VISUAL_GLOBAL, require('./visual/seriesColor'));
+    echarts.registerPreprocessor(require('./preprocessor/backwardCompat'));
+    echarts.registerLoading('default', require('./loading/default'));
+
+    // Default action
+    echarts.registerAction({
+        type: 'highlight',
+        event: 'highlight',
+        update: 'highlight'
+    }, zrUtil.noop);
+    echarts.registerAction({
+        type: 'downplay',
+        event: 'downplay',
+        update: 'downplay'
+    }, zrUtil.noop);
+
+
+    // --------
+    // Exports
+    // --------
+    echarts.zrender = zrender;
+
+    echarts.List = require('./data/List');
+    echarts.Model = require('./model/Model');
+
+    echarts.Axis = require('./coord/Axis');
+
+    echarts.graphic = require('./util/graphic');
+    echarts.number = require('./util/number');
+    echarts.format = require('./util/format');
+    echarts.throttle = throttle.throttle;
+    echarts.matrix = require('zrender/core/matrix');
+    echarts.vector = require('zrender/core/vector');
+    echarts.color = require('zrender/tool/color');
+
+    echarts.util = {};
+    each([
+            'map', 'each', 'filter', 'indexOf', 'inherits', 'reduce', 'filter',
+            'bind', 'curry', 'isArray', 'isString', 'isObject', 'isFunction',
+            'extend', 'defaults', 'clone', 'merge'
+        ],
+        function (name) {
+            echarts.util[name] = zrUtil[name];
+        }
+    );
+
+    echarts.helper = require('./helper');
+
+
+    // PRIORITY
+    echarts.PRIORITY = {
+        PROCESSOR: {
+            FILTER: PRIORITY_PROCESSOR_FILTER,
+            STATISTIC: PRIORITY_PROCESSOR_STATISTIC
+        },
+        VISUAL: {
+            LAYOUT: PRIORITY_VISUAL_LAYOUT,
+            GLOBAL: PRIORITY_VISUAL_GLOBAL,
+            CHART: PRIORITY_VISUAL_CHART,
+            COMPONENT: PRIORITY_VISUAL_COMPONENT,
+            BRUSH: PRIORITY_VISUAL_BRUSH
+        }
+    };
+
+    return echarts;
 });
